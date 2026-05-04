@@ -4,10 +4,10 @@
 
   <modelVersion>4.0.0</modelVersion>
   <groupId>com.lauriewired</groupId>
-  <artifactId>GhidraMCP</artifactId>
+  <artifactId>GhidraMCPMultiProgram</artifactId>
   <packaging>jar</packaging>
-  <version>1.0-SNAPSHOT</version>
-  <name>GhidraMCP</name>
+  <version>0.2.0</version>
+  <name>GhidraMCPMultiProgram</name>
   <url>http://maven.apache.org</url>
 
   <dependencies>
@@ -15,56 +15,56 @@
     <dependency>
       <groupId>ghidra</groupId>
       <artifactId>Generic</artifactId>
-      <version>11.3.2</version>
+      <version>12.0.4</version>
       <scope>system</scope>
       <systemPath>${project.basedir}/lib/Generic.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>ghidra</groupId>
       <artifactId>SoftwareModeling</artifactId>
-      <version>11.3.2</version>
+      <version>12.0.4</version>
       <scope>system</scope>
       <systemPath>${project.basedir}/lib/SoftwareModeling.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>ghidra</groupId>
       <artifactId>Project</artifactId>
-      <version>11.3.2</version>
+      <version>12.0.4</version>
       <scope>system</scope>
       <systemPath>${project.basedir}/lib/Project.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>ghidra</groupId>
       <artifactId>Docking</artifactId>
-      <version>11.3.2</version>
+      <version>12.0.4</version>
       <scope>system</scope>
       <systemPath>${project.basedir}/lib/Docking.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>ghidra</groupId>
       <artifactId>Decompiler</artifactId>
-      <version>11.3.2</version>
+      <version>12.0.4</version>
       <scope>system</scope>
       <systemPath>${project.basedir}/lib/Decompiler.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>ghidra</groupId>
       <artifactId>Utility</artifactId>
-      <version>11.3.2</version>
+      <version>12.0.4</version>
       <scope>system</scope>
       <systemPath>${project.basedir}/lib/Utility.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>ghidra</groupId>
       <artifactId>Base</artifactId>
-      <version>11.3.2</version>
+      <version>12.0.4</version>
       <scope>system</scope>
       <systemPath>${project.basedir}/lib/Base.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>ghidra</groupId>
       <artifactId>Gui</artifactId>
-      <version>11.3.2</version>
+      <version>12.0.4</version>
       <scope>system</scope>
       <systemPath>${project.basedir}/lib/Gui.jar</systemPath>
     </dependency>
@@ -89,7 +89,7 @@
             <manifestFile>src/main/resources/META-INF/MANIFEST.MF</manifestFile>
           </archive>
           <!-- Set a fixed name for the JAR without version -->
-          <finalName>GhidraMCP</finalName>
+          <finalName>GhidraMCPMultiProgram</finalName>
           <!-- Exclude the App class -->
           <excludes>
             <exclude>**/App.class</exclude>
@@ -111,7 +111,7 @@
           </descriptors>
           
           <!-- The name of the final zip -->
-          <finalName>GhidraMCP-${project.version}</finalName>
+          <finalName>GhidraMCPMultiProgram-${project.version}</finalName>
           
           <!-- Don't append the assembly ID -->
           <appendAssemblyId>false</appendAssemblyId>

@@ -1,4 +1,4 @@
-package com.lauriewired;
+package com.krakty.ghidramcp;
 
 import junit.framework.Test;
 import junit.framework.TestCase;
