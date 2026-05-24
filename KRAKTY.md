@@ -5,9 +5,14 @@ makes the plugin **per-tool**: each open Ghidra CodeBrowser window binds its
 own HTTP server on a unique port, so MCP clients can address multiple loaded
 programs in parallel without GUI program-switching.
 
-Built and tested against **Ghidra 12.0.4**.
+Built and tested against **Ghidra 12.1** (previously 12.0.4 — see HANDOFF.md
+for the upgrade record).
 
-## Architecture (v0.2.0)
+> **End-user docs live in [README.md](README.md).** This file is the design /
+> decision log: architecture choices, gotchas, and history. Read README first
+> for build / install / usage; come here for the *why*.
+
+## Architecture (v0.2.x)
 
 The plugin is loaded once per `PluginTool` instance (Ghidra default behavior;
 each CodeBrowser window is its own tool). On startup, each instance:
@@ -28,11 +33,11 @@ Each port serves a JSON discovery payload:
 ```json
 GET /info
 {
-  "version":    "0.2.0",
+  "version":    "0.2.1",
   "port":       8090,
   "toolName":   "CodeBrowser",
-  "name":       "05-01-2026-LIVE-eqgame.exe",
-  "datePrefix": "05-01-2026"
+  "name":       "05-22-2026-LIVE-eqgame.exe",
+  "datePrefix": "05-22-2026"
 }
 ```
 
@@ -46,72 +51,27 @@ GET /info
 Clients (MCP bridge, Claude, scripts) discover what's bound by hitting
 `/info` on each port in 8090-8099 and ignoring the ones that don't respond.
 
-## Build
+## Build & install
 
-Requires Ghidra 12.0.4 jars in `lib/`. Copy them from your installation:
-
-```sh
-cd lib/
-for j in Generic SoftwareModeling Project Docking Decompiler Utility Base Gui; do
-  find /opt/ghidra/Ghidra -name "${j}.jar" -exec cp {} . \;
-done
-```
-
-Then:
-
-```sh
-mvn clean package
-```
-
-Output: `target/GhidraMCPMultiProgram-<version>.zip` (e.g.,
-`GhidraMCPMultiProgram-0.2.0.zip`).
-
-## Install
-
-In Ghidra: **File → Install Extensions → +** → select the zip → restart
-Ghidra. The plugin loads automatically (it's in the Developer category).
-
-To upgrade: install the new zip on top of the existing one. Ghidra will
-warn about an existing extension and prompt to remove on restart, then
-install the new one. Restart Ghidra.
-
-## MCP client configuration
-
-`.mcp.json` should have one entry per port in the range, all pointed at the
-laptop running Ghidra:
-
-```json
-{
-  "mcpServers": {
-    "ghidra-8090": {
-      "command": "/path/to/.venv/bin/python",
-      "args": [
-        "/path/to/bridge_mcp_ghidra.py",
-        "--ghidra-server",
-        "http://127.0.0.1:8090/"
-      ]
-    },
-    "ghidra-8091": { "...": "(same with 8091)" }
-  }
-}
-```
-
-Ports without an active CodeBrowser instance error out per call but are
-otherwise harmless — Claude can still use the active ones.
+See [README.md](README.md) for full build and install instructions. Short
+version: copy eight JARs from your Ghidra 12.1 install into `lib/`, then
+`mvn clean package`, then `File → Install Extensions` in Ghidra with the
+resulting ZIP.
 
 ## Versioning
 
-- `pom.xml` `<version>` drives the zip filename.
-- `extension.properties` has TWO version fields:
-  - `version=12.0.4` is the Ghidra compatibility version (must match
-    installed Ghidra; mismatch causes the install to be rejected).
-  - `ghidraVersion=12.0.4` is the same.
-- `PLUGIN_VERSION` static in `GhidraMCPMultiProgramPlugin.java` is shown in
-  startup logs and the `/info` response.
+Two version numbers, deliberately separate:
 
-When iterating, bump the pom version + `PLUGIN_VERSION` constant. Do **not**
-change `version=`/`ghidraVersion=` in `extension.properties` — those reflect
-Ghidra's version, not ours.
+- **Plugin version** (e.g. `0.2.1`) — tracks fork changes (features, fixes).
+  Lives in `pom.xml` `<version>`, `extension.properties` `version=`, and
+  `PLUGIN_VERSION` in the plugin source. Bump on every release.
+- **Ghidra version** (e.g. `12.1`) — Ghidra release this build is compatible
+  with. Lives in `extension.properties` `ghidraVersion=` and the eight
+  `<version>` entries on the system-scoped dependencies in `pom.xml`. Bump
+  only when migrating to a new Ghidra.
+
+Ghidra silently drops any extension whose `ghidraVersion` doesn't match the
+running Ghidra. `Help → Show Log` will reveal the mismatch.
 
 ## Critical extension.zip structure
 
@@ -153,6 +113,24 @@ Architecture iterations during development:
   events are tool-scoped and cross-tool tracking required brittle
   `DomainFolderChangeListener` plumbing. Ended with split state when the
   plugin was loaded in multiple tools.
-- **v0.2.0 (current)**: Per-tool plugin, port-per-tool, no central
-  coordination. Each CodeBrowser instance is independent. Slot abstraction
-  removed (clients use `/info` for discovery instead).
+- **v0.2.0**: Per-tool plugin, port-per-tool, no central coordination. Each
+  CodeBrowser instance is independent. Slot abstraction removed (clients use
+  `/info` for discovery instead). First Ghidra 12.0.4 build.
+- **v0.2.1 (current)**:
+  - Migrated build to **Ghidra 12.1** (was 12.0.4).
+  - `/renameData` now creates a bare label when no `Data` is defined at the
+    address (was a silent no-op in 0.2.0). Enables bulk-labeling tools to
+    annotate symbols Ghidra's auto-analysis hasn't classified as data.
+
+### Dead code from v0.1.x
+
+`SlotAssigner.java`, `ProgramServer.java`, and the
+`discoveryServer` / `registerProjectListener()` / `rebuildProgramServers()`
+methods in `GhidraMCPMultiProgramPlugin.java` are leftovers from v0.1.x. They
+compile but are **never called** from the plugin lifecycle — the per-tool
+init in the constructor takes the only execution path. The
+`@PluginInfo.description` string ("Discovery on 8089, slots on 8090-8095") is
+also stale text from that era.
+
+A future cleanup pass should remove them. Until then they're harmless but
+misleading to readers exploring the codebase.

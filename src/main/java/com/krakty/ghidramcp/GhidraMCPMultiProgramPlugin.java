@@ -102,7 +102,7 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
      * singleton, no cross-tool coordination, no discovery server. Each port
      * exposes a /info endpoint Claude can scan to discover what's bound.
      */
-    public  static final String PLUGIN_VERSION = "0.2.0";
+    public  static final String PLUGIN_VERSION = "0.2.1";
     private static final int PORT_RANGE_LOW  = 8090;
     private static final int PORT_RANGE_HIGH = 8099;
     private int boundPort = -1;
@@ -1212,12 +1212,22 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
                     Address addr = program.getAddressFactory().getAddress(addressStr);
                     Listing listing = program.getListing();
                     Data data = listing.getDefinedDataAt(addr);
+                    SymbolTable symTable = program.getSymbolTable();
+                    Symbol symbol = symTable.getPrimarySymbol(addr);
                     if (data != null) {
-                        SymbolTable symTable = program.getSymbolTable();
-                        Symbol symbol = symTable.getPrimarySymbol(addr);
+                        // Data item already defined — rename or create label
                         if (symbol != null) {
                             symbol.setName(newName, SourceType.USER_DEFINED);
                         } else {
+                            symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
+                        }
+                    } else {
+                        // v0.2.1: data not defined — still create a bare label.
+                        // This lets bulk-labeling tools annotate data symbols whose
+                        // addresses Ghidra's auto-analysis didn't classify as data.
+                        if (symbol != null && !symbol.getName().equals(newName)) {
+                            symbol.setName(newName, SourceType.USER_DEFINED);
+                        } else if (symbol == null) {
                             symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
                         }
                     }
