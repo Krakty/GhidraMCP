@@ -86,15 +86,6 @@ GET /info
 Clients are expected to probe `/info` on every port in `8090–8099` and ignore
 the ones that don't respond (connection refused = no tool bound there).
 
-### Dead code: v0.1.x slot/discovery model
-
-The source still contains the abandoned v0.1.x design (`SlotAssigner`,
-`ProgramServer`, `discoveryServer`, `registerProjectListener()`,
-`rebuildProgramServers()`). Those methods are **defined but never called** from
-the plugin's lifecycle — they were superseded by the per-tool model above.
-Leaving them in place pending a cleanup pass; they do not affect runtime
-behavior.
-
 ---
 
 ## Endpoint reference
@@ -431,9 +422,7 @@ upgrade.
 ├── src/
 │   ├── main/
 │   │   ├── java/com/krakty/ghidramcp/
-│   │   │   ├── GhidraMCPMultiProgramPlugin.java    # plugin entry + all endpoints
-│   │   │   ├── ProgramServer.java                  # dead v0.1.x helper (see Architecture)
-│   │   │   └── SlotAssigner.java                   # dead v0.1.x helper (see Architecture)
+│   │   │   └── GhidraMCPMultiProgramPlugin.java    # plugin entry + all endpoints
 │   │   └── resources/
 │   │       ├── extension.properties                # version + ghidraVersion
 │   │       ├── Module.manifest                     # MODULE DIR directive

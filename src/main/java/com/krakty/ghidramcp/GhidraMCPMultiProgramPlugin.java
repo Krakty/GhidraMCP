@@ -1,17 +1,8 @@
 package com.krakty.ghidramcp;
 
-import ghidra.framework.model.DomainFile;
-import ghidra.framework.model.DomainFolder;
-import ghidra.framework.model.DomainFolderChangeListener;
-import ghidra.framework.model.DomainObject;
-import ghidra.framework.model.Project;
-import ghidra.framework.model.ProjectData;
-import ghidra.framework.model.ToolManager;
 import ghidra.framework.plugintool.Plugin;
 import ghidra.framework.plugintool.PluginEvent;
 import ghidra.framework.plugintool.PluginTool;
-import ghidra.app.events.OpenProgramPluginEvent;
-import ghidra.app.events.CloseProgramPluginEvent;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.GlobalNamespace;
 import ghidra.program.model.listing.*;
@@ -66,7 +57,6 @@ import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @PluginInfo(
@@ -74,37 +64,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
     packageName = ghidra.app.DeveloperPluginPackage.NAME,
     category = PluginCategoryNames.ANALYSIS,
     shortDescription = "GhidraMCP Multi-Program HTTP server plugin (Krakty)",
-    description = "Per-program HTTP servers on dedicated ports plus discovery endpoint. Discovery on 8089, slots on 8090-8095. Default legacy single-program port 8088."
+    description = "Per-tool HTTP server: each CodeBrowser binds its own port in 8090-8099 and serves the active program. Clients use /info on each port for discovery."
 )
 public class GhidraMCPMultiProgramPlugin extends Plugin {
-
-    private HttpServer server;            // Legacy single-program server (port 8080 by default).
-    private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
-    private static final String PORT_OPTION_NAME = "Server Port";
-    private static final int DEFAULT_PORT = 8088;
-
-    // Multi-program server infrastructure.
-    private static final int DISCOVERY_PORT = 8089;
-    private HttpServer discoveryServer;
-    /**
-     * Registry of active per-program HTTP servers, keyed by SLOT NAME ("eqgame",
-     * "eqgame-old", etc) rather than Program object. Slot name is stable; Program
-     * object identity is not guaranteed to be stable across Ghidra calls or plugin
-     * reloads, which can cause the registry to desync from actually-bound ports.
-     */
-    private final Map<String, ProgramServer> programServers = new ConcurrentHashMap<>();
-    private final List<SlotAssigner.SlotFamily> slotFamilies = SlotAssigner.defaultFamilies();
 
     /**
      * Per-tool plugin: each CodeBrowser instance binds its own HTTP server on
      * the first free port in PORT_RANGE_LOW..PORT_RANGE_HIGH and serves the
      * program currently active in that tool via getCurrentProgram(). No JVM
      * singleton, no cross-tool coordination, no discovery server. Each port
-     * exposes a /info endpoint Claude can scan to discover what's bound.
+     * exposes a /info endpoint clients can scan to discover what's bound.
      */
     public  static final String PLUGIN_VERSION = "0.2.1";
     private static final int PORT_RANGE_LOW  = 8090;
     private static final int PORT_RANGE_HIGH = 8099;
+
+    private HttpServer server;
     private int boundPort = -1;
 
     public GhidraMCPMultiProgramPlugin(PluginTool tool) {
@@ -137,239 +112,43 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             + ") bound to port " + boundPort);
     }
 
+
     // ----------------------------------------------------------------------------------
-    // Per-program server registry
+    // Display-name helpers (used by /info)
     // ----------------------------------------------------------------------------------
+
+    /** Date prefix at the start of a program name, e.g. "05-22-2026-..." */
+    private static final java.util.regex.Pattern DATE_PREFIX =
+        java.util.regex.Pattern.compile("^(\\d{2})-(\\d{2})-(\\d{4})-.*");
 
     /**
-     * Recompute slot assignments from the currently-open program list and
-     * reconcile the live ProgramServer registry with the new layout. Programs
-     * that lost a slot have their server torn down; programs whose slot moved
-     * have the old server torn down and a new one bound on the new port.
+     * Returns the program's display name: the DomainFile name (what shows in
+     * the Project tree, which the user may have renamed for visual
+     * distinctness — e.g. "05-22-2026-LIVE-eqgame.exe") falling back to
+     * Program.getName() if no DomainFile is available.
      */
-    /**
-     * Register a project-level listener so we get notified about program
-     * open/close events across ALL running tools, not just the one our plugin
-     * lives in. Without this, a program opened in CodeBrowser-2 wouldn't reach
-     * a plugin instance running in CodeBrowser-1.
-     */
-    private void registerProjectListener() {
-        Project project = tool.getProject();
-        if (project == null) return;
-        ProjectData pd = project.getProjectData();
-        if (pd == null) return;
-        pd.addDomainFolderChangeListener(new DomainFolderChangeListener() {
-            @Override
-            public void domainFileObjectOpenedForUpdate(DomainFile file, DomainObject object) {
-                SwingUtilities.invokeLater(new Runnable() {
-                    @Override public void run() { rebuildProgramServers(); }
-                });
+    private static String effectiveName(Program p) {
+        if (p == null) return "";
+        try {
+            ghidra.framework.model.DomainFile df = p.getDomainFile();
+            if (df != null) {
+                String n = df.getName();
+                if (n != null && !n.isEmpty()) return n;
             }
-            @Override
-            public void domainFileObjectClosed(DomainFile file, DomainObject object) {
-                SwingUtilities.invokeLater(new Runnable() {
-                    @Override public void run() { rebuildProgramServers(); }
-                });
-            }
-            // All other DomainFolderChangeListener methods inherit empty defaults
-            // (they're declared as default methods on the interface in modern Ghidra).
-        });
+        }
+        catch (Exception ignored) { /* fall through to Program.getName() */ }
+        return p.getName();
     }
 
-    /**
-     * Returns every Program that is open in ANY running tool of the current
-     * project, deduplicated. A program may be open in multiple CodeBrowser
-     * tools simultaneously; we only want to see it once.
-     */
-    private List<Program> enumerateAllOpenPrograms() {
-        java.util.LinkedHashSet<Program> seen = new java.util.LinkedHashSet<>();
-        Project project = tool.getProject();
-        if (project != null) {
-            ToolManager tm = project.getToolManager();
-            if (tm != null) {
-                PluginTool[] running = tm.getRunningTools();
-                if (running != null) {
-                    for (PluginTool t : running) {
-                        ProgramManager pm = t.getService(ProgramManager.class);
-                        if (pm == null) continue;
-                        Program[] arr = pm.getAllOpenPrograms();
-                        if (arr == null) continue;
-                        for (Program p : arr) {
-                            if (p != null) seen.add(p);
-                        }
-                    }
-                }
-            }
-        }
-        // Fallback: also include this tool's programs in case enumeration above
-        // missed something (defensive — should be a no-op when ToolManager works).
-        ProgramManager myPm = tool.getService(ProgramManager.class);
-        if (myPm != null) {
-            Program[] arr = myPm.getAllOpenPrograms();
-            if (arr != null) {
-                for (Program p : arr) {
-                    if (p != null) seen.add(p);
-                }
-            }
-        }
-        return new ArrayList<>(seen);
+    /** Returns "MM-DD-YYYY" if the program name starts with one, else empty. */
+    private static String extractDatePrefix(String programName) {
+        if (programName == null) return "";
+        java.util.regex.Matcher m = DATE_PREFIX.matcher(programName);
+        if (!m.matches()) return "";
+        return m.group(1) + "-" + m.group(2) + "-" + m.group(3);
     }
 
-    private synchronized void rebuildProgramServers() {
-        // Programs can be open in any of the project's running tools (multiple
-        // CodeBrowser windows etc.). Enumerate all of them, not just our own.
-        List<Program> open = enumerateAllOpenPrograms();
-        SlotAssigner.AssignmentResult plan = SlotAssigner.assign(open, slotFamilies);
-
-        // Build a quick lookup of "slotName -> assignment" from the plan.
-        // Slot name is the stable identifier (Program object identity isn't reliable).
-        Map<String, SlotAssigner.Assignment> desiredBySlot = new HashMap<>();
-        for (SlotAssigner.Assignment a : plan.assignments) {
-            desiredBySlot.put(a.slotName, a);
-        }
-
-        // 1) Tear down servers whose slot is no longer desired, OR where the bound
-        //    program has changed (different program now assigned to that slot).
-        List<String> toRemove = new ArrayList<>();
-        for (Map.Entry<String, ProgramServer> entry : programServers.entrySet()) {
-            String slot = entry.getKey();
-            ProgramServer existing = entry.getValue();
-            SlotAssigner.Assignment want = desiredBySlot.get(slot);
-            boolean teardown = false;
-            String reason;
-            if (want == null) {
-                teardown = true;
-                reason = "slot no longer in desired plan";
-            } else if (want.program != existing.getProgram()) {
-                teardown = true;
-                reason = "different program now assigned to slot";
-            } else if (want.port != existing.getPort()) {
-                teardown = true;
-                reason = "port changed (was " + existing.getPort() + ", now " + want.port + ")";
-            } else {
-                reason = "ok";
-            }
-            if (teardown) {
-                Msg.info(this, "Tearing down server slot=" + slot
-                    + " port=" + existing.getPort()
-                    + " program=" + SlotAssigner.effectiveName(existing.getProgram())
-                    + " (" + reason + ")");
-                existing.shutdown();
-                toRemove.add(slot);
-            }
-        }
-        for (String slot : toRemove) {
-            programServers.remove(slot);
-        }
-
-        // 2) Spin up servers for every desired assignment that doesn't already exist.
-        for (SlotAssigner.Assignment a : plan.assignments) {
-            if (programServers.containsKey(a.slotName)) {
-                continue; // already serving this slot with the right program
-            }
-            try {
-                ProgramServer ps = new ProgramServer(a.program, a.slotName, a.port);
-                registerProgramEndpoints(ps);
-                ps.start();
-                programServers.put(a.slotName, ps);
-                Msg.info(this, "Assigned program=" + SlotAssigner.effectiveName(a.program)
-                    + " to slot=" + a.slotName
-                    + " port=" + a.port
-                    + " datePrefix=" + a.datePrefix);
-            } catch (IOException e) {
-                Msg.error(this, "Failed to bind ProgramServer slot=" + a.slotName
-                    + " on port " + a.port
-                    + " (program " + SlotAssigner.effectiveName(a.program) + ")", e);
-            }
-        }
-
-        // 3) Log any programs that matched a family but couldn't be placed.
-        for (SlotAssigner.Unassigned u : plan.unassigned) {
-            Msg.warn(this, "No port assigned for program '"
-                + SlotAssigner.effectiveName(u.program)
-                + "': " + u.reason);
-        }
-    }
-
-    /** {@link SlotAssigner.Assignment#slotName} already contains the "-old" suffix when applicable. */
-    private static String slotNameWithSuffix(SlotAssigner.Assignment a) {
-        return a.slotName;
-    }
-
-    // ----------------------------------------------------------------------------------
-    // Discovery server (port 8089)
-    // ----------------------------------------------------------------------------------
-
-    private void startDiscoveryServer() throws IOException {
-        if (discoveryServer != null) {
-            discoveryServer.stop(0);
-            discoveryServer = null;
-        }
-        discoveryServer = HttpServer.create(new InetSocketAddress(DISCOVERY_PORT), 0);
-        discoveryServer.createContext("/programs", new com.sun.net.httpserver.HttpHandler() {
-            @Override
-            public void handle(HttpExchange exchange) throws IOException {
-                String json = buildProgramsJson();
-                byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-                exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-                exchange.sendResponseHeaders(200, bytes.length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(bytes);
-                }
-            }
-        });
-        discoveryServer.setExecutor(null);
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    discoveryServer.start();
-                    Msg.info(GhidraMCPMultiProgramPlugin.this,
-                        "GhidraMCP discovery server started on port " + DISCOVERY_PORT);
-                } catch (Exception e) {
-                    Msg.error(GhidraMCPMultiProgramPlugin.this,
-                        "Failed to start discovery server on port " + DISCOVERY_PORT, e);
-                    discoveryServer = null;
-                }
-            }
-        }, "GhidraMCP-Discovery").start();
-    }
-
-    private String buildProgramsJson() {
-        // Take an immutable snapshot of the data we need INSIDE the lock,
-        // then build JSON OUTSIDE the lock. This avoids touching ProgramServers
-        // (or their bound Programs) after they may have been torn down.
-        List<String[]> rows = new ArrayList<>();
-        synchronized (this) {
-            for (ProgramServer ps : programServers.values()) {
-                String name = SlotAssigner.effectiveName(ps.getProgram());
-                String prefix = SlotAssigner.extractDatePrefix(name);
-                if (prefix == null) prefix = "";
-                rows.add(new String[]{
-                    name,
-                    ps.getSlotName(),
-                    String.valueOf(ps.getPort()),
-                    prefix
-                });
-            }
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.append('[');
-        boolean first = true;
-        for (String[] r : rows) {
-            if (!first) sb.append(',');
-            first = false;
-            sb.append('{');
-            sb.append("\"name\":").append(jsonString(r[0])).append(',');
-            sb.append("\"slot\":").append(jsonString(r[1])).append(',');
-            sb.append("\"port\":").append(r[2]).append(',');
-            sb.append("\"datePrefix\":").append(jsonString(r[3]));
-            sb.append('}');
-        }
-        sb.append(']');
-        return sb.toString();
-    }
-
+    /** Minimal JSON string escaper for the /info handler. */
     private static String jsonString(String s) {
         if (s == null) return "\"\"";
         StringBuilder sb = new StringBuilder(s.length() + 2);
@@ -383,11 +162,8 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
                 case '\r': sb.append("\\r"); break;
                 case '\t': sb.append("\\t"); break;
                 default:
-                    if (c < 0x20) {
-                        sb.append(String.format("\\u%04x", (int) c));
-                    } else {
-                        sb.append(c);
-                    }
+                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                    else          sb.append(c);
             }
         }
         sb.append('"');
@@ -395,292 +171,8 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
     }
 
     // ----------------------------------------------------------------------------------
-    // Per-program endpoint registration
-    // ----------------------------------------------------------------------------------
-
-    /**
-     * Register every endpoint on the given ProgramServer so they operate on its
-     * specific bound Program (not getCurrentProgram()).
-     */
-    private void registerProgramEndpoints(ProgramServer ps) {
-        ps.register("/methods", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-                sendResponse(exchange, getAllFunctionNames(program, offset, limit));
-            }
-        });
-
-        ps.register("/classes", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-                sendResponse(exchange, getAllClassNames(program, offset, limit));
-            }
-        });
-
-        ps.register("/decompile", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                String name = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                sendResponse(exchange, decompileFunctionByName(program, name));
-            }
-        });
-
-        ps.register("/renameFunction", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> params = parsePostParams(exchange);
-                String response = renameFunction(program, params.get("oldName"), params.get("newName"))
-                        ? "Renamed successfully" : "Rename failed";
-                sendResponse(exchange, response);
-            }
-        });
-
-        ps.register("/renameData", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> params = parsePostParams(exchange);
-                renameDataAtAddress(program, params.get("address"), params.get("newName"));
-                sendResponse(exchange, "Rename data attempted");
-            }
-        });
-
-        ps.register("/renameVariable", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> params = parsePostParams(exchange);
-                String functionName = params.get("functionName");
-                String oldName = params.get("oldName");
-                String newName = params.get("newName");
-                String result = renameVariableInFunction(program, functionName, oldName, newName);
-                sendResponse(exchange, result);
-            }
-        });
-
-        ps.register("/segments", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-                sendResponse(exchange, listSegments(program, offset, limit));
-            }
-        });
-
-        ps.register("/imports", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-                sendResponse(exchange, listImports(program, offset, limit));
-            }
-        });
-
-        ps.register("/exports", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-                sendResponse(exchange, listExports(program, offset, limit));
-            }
-        });
-
-        ps.register("/namespaces", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-                sendResponse(exchange, listNamespaces(program, offset, limit));
-            }
-        });
-
-        ps.register("/data", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit  = parseIntOrDefault(qparams.get("limit"),  100);
-                sendResponse(exchange, listDefinedData(program, offset, limit));
-            }
-        });
-
-        ps.register("/searchFunctions", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                String searchTerm = qparams.get("query");
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit = parseIntOrDefault(qparams.get("limit"), 100);
-                sendResponse(exchange, searchFunctionsByName(program, searchTerm, offset, limit));
-            }
-        });
-
-        ps.register("/get_function_by_address", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                String address = qparams.get("address");
-                sendResponse(exchange, getFunctionByAddress(program, address));
-            }
-        });
-
-        ps.register("/get_current_address", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                sendResponse(exchange, getCurrentAddress());
-            }
-        });
-
-        ps.register("/get_current_function", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                sendResponse(exchange, getCurrentFunction(program));
-            }
-        });
-
-        ps.register("/list_functions", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                sendResponse(exchange, listFunctions(program));
-            }
-        });
-
-        ps.register("/decompile_function", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                String address = qparams.get("address");
-                sendResponse(exchange, decompileFunctionByAddress(program, address));
-            }
-        });
-
-        ps.register("/disassemble_function", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                String address = qparams.get("address");
-                sendResponse(exchange, disassembleFunction(program, address));
-            }
-        });
-
-        ps.register("/set_decompiler_comment", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> params = parsePostParams(exchange);
-                String address = params.get("address");
-                String comment = params.get("comment");
-                boolean success = setDecompilerComment(program, address, comment);
-                sendResponse(exchange, success ? "Comment set successfully" : "Failed to set comment");
-            }
-        });
-
-        ps.register("/set_disassembly_comment", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> params = parsePostParams(exchange);
-                String address = params.get("address");
-                String comment = params.get("comment");
-                boolean success = setDisassemblyComment(program, address, comment);
-                sendResponse(exchange, success ? "Comment set successfully" : "Failed to set comment");
-            }
-        });
-
-        ps.register("/rename_function_by_address", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> params = parsePostParams(exchange);
-                String functionAddress = params.get("function_address");
-                String newName = params.get("new_name");
-                boolean success = renameFunctionByAddress(program, functionAddress, newName);
-                sendResponse(exchange, success ? "Function renamed successfully" : "Failed to rename function");
-            }
-        });
-
-        ps.register("/set_function_prototype", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> params = parsePostParams(exchange);
-                String functionAddress = params.get("function_address");
-                String prototype = params.get("prototype");
-
-                PrototypeResult result = setFunctionPrototype(program, functionAddress, prototype);
-                if (result.isSuccess()) {
-                    String successMsg = "Function prototype set successfully";
-                    if (!result.getErrorMessage().isEmpty()) {
-                        successMsg += "\n\nWarnings/Debug Info:\n" + result.getErrorMessage();
-                    }
-                    sendResponse(exchange, successMsg);
-                } else {
-                    sendResponse(exchange, "Failed to set function prototype: " + result.getErrorMessage());
-                }
-            }
-        });
-
-        ps.register("/set_local_variable_type", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> params = parsePostParams(exchange);
-                String functionAddress = params.get("function_address");
-                String variableName = params.get("variable_name");
-                String newType = params.get("new_type");
-
-                StringBuilder responseMsg = new StringBuilder();
-                responseMsg.append("Setting variable type: ").append(variableName)
-                          .append(" to ").append(newType)
-                          .append(" in function at ").append(functionAddress).append("\n\n");
-
-                DataTypeManager dtm = program.getDataTypeManager();
-                DataType directType = findDataTypeByNameInAllCategories(dtm, newType);
-                if (directType != null) {
-                    responseMsg.append("Found type: ").append(directType.getPathName()).append("\n");
-                } else if (newType.startsWith("P") && newType.length() > 1) {
-                    String baseTypeName = newType.substring(1);
-                    DataType baseType = findDataTypeByNameInAllCategories(dtm, baseTypeName);
-                    if (baseType != null) {
-                        responseMsg.append("Found base type for pointer: ").append(baseType.getPathName()).append("\n");
-                    } else {
-                        responseMsg.append("Base type not found for pointer: ").append(baseTypeName).append("\n");
-                    }
-                } else {
-                    responseMsg.append("Type not found directly: ").append(newType).append("\n");
-                }
-
-                boolean success = setLocalVariableType(program, functionAddress, variableName, newType);
-                String successMsg = success ? "Variable type set successfully" : "Failed to set variable type";
-                responseMsg.append("\nResult: ").append(successMsg);
-                sendResponse(exchange, responseMsg.toString());
-            }
-        });
-
-        ps.register("/xrefs_to", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                String address = qparams.get("address");
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit = parseIntOrDefault(qparams.get("limit"), 100);
-                sendResponse(exchange, getXrefsTo(program, address, offset, limit));
-            }
-        });
-
-        ps.register("/xrefs_from", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                String address = qparams.get("address");
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit = parseIntOrDefault(qparams.get("limit"), 100);
-                sendResponse(exchange, getXrefsFrom(program, address, offset, limit));
-            }
-        });
-
-        ps.register("/function_xrefs", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                String name = qparams.get("name");
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit = parseIntOrDefault(qparams.get("limit"), 100);
-                sendResponse(exchange, getFunctionXrefs(program, name, offset, limit));
-            }
-        });
-
-        ps.register("/strings", new ProgramServer.ProgramHandler() {
-            @Override public void handle(HttpExchange exchange, Program program) throws IOException {
-                Map<String, String> qparams = parseQueryParams(exchange);
-                int offset = parseIntOrDefault(qparams.get("offset"), 0);
-                int limit = parseIntOrDefault(qparams.get("limit"), 100);
-                String filter = qparams.get("filter");
-                sendResponse(exchange, listDefinedStrings(program, offset, limit, filter));
-            }
-        });
-    }
-
-    // ----------------------------------------------------------------------------------
-    // Legacy single-program server (port 8080 by default). PRESERVED VERBATIM in
-    // behavior: every handler still resolves the program via getCurrentProgram().
+    // Per-tool HTTP server: bound in the constructor, registers every endpoint
+    // against getCurrentProgram() so it's naturally scoped to this tool.
     // ----------------------------------------------------------------------------------
 
     private void startServer(int port) throws IOException {
@@ -698,9 +190,8 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         // hit /info on each to learn which port has which program.
         server.createContext("/info", exchange -> {
             Program p = getCurrentProgram();
-            String name = (p != null) ? SlotAssigner.effectiveName(p) : "";
-            String prefix = SlotAssigner.extractDatePrefix(name);
-            if (prefix == null) prefix = "";
+            String name = effectiveName(p);
+            String prefix = extractDatePrefix(name);
             String json = "{"
                 + "\"version\":" + jsonString(PLUGIN_VERSION) + ","
                 + "\"port\":" + boundPort + ","

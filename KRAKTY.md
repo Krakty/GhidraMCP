@@ -121,16 +121,10 @@ Architecture iterations during development:
   - `/renameData` now creates a bare label when no `Data` is defined at the
     address (was a silent no-op in 0.2.0). Enables bulk-labeling tools to
     annotate symbols Ghidra's auto-analysis hasn't classified as data.
-
-### Dead code from v0.1.x
-
-`SlotAssigner.java`, `ProgramServer.java`, and the
-`discoveryServer` / `registerProjectListener()` / `rebuildProgramServers()`
-methods in `GhidraMCPMultiProgramPlugin.java` are leftovers from v0.1.x. They
-compile but are **never called** from the plugin lifecycle — the per-tool
-init in the constructor takes the only execution path. The
-`@PluginInfo.description` string ("Discovery on 8089, slots on 8090-8095") is
-also stale text from that era.
-
-A future cleanup pass should remove them. Until then they're harmless but
-misleading to readers exploring the codebase.
+  - Dead v0.1.x code removed: `SlotAssigner.java`, `ProgramServer.java`, and
+    the discovery-server / project-listener / slot-rebuild scaffolding in
+    `GhidraMCPMultiProgramPlugin.java`. Two small display-name helpers
+    (`effectiveName`, `extractDatePrefix`) that the live `/info` handler
+    relied on were inlined into the plugin file. Plugin source shrank from
+    2753 lines across 3 files to 1918 lines in 1 file. Stale
+    `@PluginInfo.description` text was also corrected.
