@@ -117,9 +117,14 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
     // Display-name helpers (used by /info)
     // ----------------------------------------------------------------------------------
 
-    /** Date prefix at the start of a program name, e.g. "05-22-2026-..." */
+    /**
+     * Date prefix at the start of a program name. Accepts both "05-22-2026-..."
+     * and "6-9-2026-..." (unpadded month/day). The captured groups get
+     * zero-padded by {@link #extractDatePrefix} so clients always receive
+     * canonical MM-DD-YYYY.
+     */
     private static final java.util.regex.Pattern DATE_PREFIX =
-        java.util.regex.Pattern.compile("^(\\d{2})-(\\d{2})-(\\d{4})-.*");
+        java.util.regex.Pattern.compile("^(\\d{1,2})-(\\d{1,2})-(\\d{4})-.*");
 
     /**
      * Returns the program's display name: the DomainFile name (what shows in
@@ -140,12 +145,17 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         return p.getName();
     }
 
-    /** Returns "MM-DD-YYYY" if the program name starts with one, else empty. */
+    /**
+     * Returns zero-padded "MM-DD-YYYY" if the program name starts with a
+     * recognizable date prefix (padded or unpadded), else empty.
+     */
     private static String extractDatePrefix(String programName) {
         if (programName == null) return "";
         java.util.regex.Matcher m = DATE_PREFIX.matcher(programName);
         if (!m.matches()) return "";
-        return m.group(1) + "-" + m.group(2) + "-" + m.group(3);
+        int mm = Integer.parseInt(m.group(1));
+        int dd = Integer.parseInt(m.group(2));
+        return String.format("%02d-%02d-%s", mm, dd, m.group(3));
     }
 
     /** Minimal JSON string escaper for the /info handler. */
