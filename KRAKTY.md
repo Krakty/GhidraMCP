@@ -117,7 +117,15 @@ Architecture iterations during development:
   CodeBrowser instance is independent. Slot abstraction removed (clients use
   `/info` for discovery instead). First Ghidra 12.0.4 build.
 - **v0.2.1 (current)**:
-  - Migrated build to **Ghidra 12.1** (was 12.0.4).
+  - Migrated build to **Ghidra 12.1.2** (was 12.0.4; passed through 12.1
+    briefly while Ghidra was 12.1, then re-targeted when laptop patched
+    to 12.1.2).
+  - Added `deploy_plugin.sh`: detects target host's installed Ghidra version
+    from `application.properties` and patches the deployed
+    `extension.properties` `ghidraVersion=` at install time. Means we don't
+    need to bump the repo for every Ghidra patch release — the in-repo
+    `ghidraVersion=` is just the last-built target; the script overrides per
+    deploy. Also has `--clean-stale` to sweep old per-version Extensions dirs.
   - `/renameData` now creates a bare label when no `Data` is defined at the
     address (was a silent no-op in 0.2.0). Enables bulk-labeling tools to
     annotate symbols Ghidra's auto-analysis hasn't classified as data.

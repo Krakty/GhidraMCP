@@ -225,6 +225,31 @@ without re-verifying the ZIP layout.
 
 ## Installing in Ghidra
 
+### Option A — `deploy_plugin.sh` (recommended for repeat deploys)
+
+`deploy_plugin.sh` builds the ZIP, **reads the running Ghidra's version from
+the target host**, patches `extension.properties` `ghidraVersion=` to match,
+and unzips into the correct `~/.config/ghidra/ghidra_<version>_DEV/Extensions/`
+dir over SSH. Use this so you don't have to bump `ghidraVersion=` in the repo
+for every Ghidra patch release.
+
+```sh
+./deploy_plugin.sh [--host HOST] [--ghidra-install PATH] [--no-build] [--clean-stale]
+```
+
+- Default `--host` is `your-ghidra-host`; override for your setup.
+- Default `--ghidra-install` is `/opt/ghidra`.
+- `--no-build` reuses the existing `target/*.zip`.
+- `--clean-stale` deletes any `GhidraMCPMultiProgram` dirs under
+  `~/.config/ghidra/ghidra_*_DEV/Extensions/` whose version isn't the one
+  you're deploying — keeps the host tidy after Ghidra patches.
+
+The script refuses to run if Ghidra is currently running on the target (the
+JVM holds the extension JAR open and installs would silently fail). Close
+Ghidra first; restart it after the script finishes.
+
+### Option B — Ghidra GUI installer
+
 1. `File → Install Extensions`
 2. Click **`+`** and select `target/GhidraMCPMultiProgram-<version>.zip`
 3. **Restart Ghidra**. The plugin loads automatically under the **Developer**
@@ -235,6 +260,10 @@ without re-verifying the ZIP layout.
 
 To upgrade: install the new ZIP on top; Ghidra warns about the existing
 extension, removes it on restart, and installs the new one.
+
+**Caveat**: this path won't help you across Ghidra patch versions unless you
+also bump `extension.properties` `ghidraVersion=` and rebuild. Use
+`deploy_plugin.sh` to skip that step.
 
 ### Verifying it's running
 
@@ -386,7 +415,12 @@ There are deliberately two version numbers:
   upgrades.
 
 Mismatching `ghidraVersion` against the running Ghidra causes Ghidra to drop
-the extension silently — `Help → Show Log` will note the mismatch.
+the extension silently — `Help → Show Log` will note the mismatch. Ghidra
+performs **exact string equality** on `ghidraVersion`, so a build pinned to
+`12.1` won't load on `12.1.2`. To avoid bumping the repo on every patch
+release, use `deploy_plugin.sh` (see "Installing in Ghidra"); it patches the
+shipped `extension.properties` on the fly from the target host's installed
+Ghidra version.
 
 ---
 
@@ -432,6 +466,7 @@ upgrade.
 │   └── test/                                       # placeholder JUnit
 ├── bridge_mcp_ghidra.py             # Python MCP bridge (FastMCP)
 ├── deploy_bridge.sh                 # copy bridge to ~/.claude/mcp-servers/
+├── deploy_plugin.sh                 # build + push Java JAR to remote Ghidra host
 ├── KRAKTY.md                        # fork architecture notes / decision log
 ├── HANDOFF.md                       # historical: Ghidra 12.0.4 → 12.1 upgrade
 └── README.md                        # this file
