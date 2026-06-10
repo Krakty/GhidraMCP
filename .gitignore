@@ -4,6 +4,10 @@
 # Compiled class files
 *.class
 
+# Python bytecode (bridge_mcp_ghidra.py)
+__pycache__/
+*.pyc
+
 # Logs
 *.log
 
