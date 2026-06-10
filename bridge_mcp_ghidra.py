@@ -23,6 +23,12 @@ mcp = FastMCP("ghidra-mcp")
 # Initialize ghidra_server_url with default value
 ghidra_server_url = DEFAULT_GHIDRA_SERVER
 
+# Cached /info payload + display label, populated by _identify_program() at
+# startup. Empty dict until then; tools that read it should treat absence as
+# "Ghidra not reachable yet".
+program_info_cache: dict = {}
+program_label: str = ""
+
 def safe_get(endpoint: str, params: dict = None) -> list:
     """
     Perform a GET request with optional query parameters.
@@ -287,6 +293,82 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
         params["filter"] = filter
     return safe_get("strings", params)
 
+@mcp.tool()
+def program_info() -> dict:
+    """
+    Identify the Ghidra program this MCP server is bound to.
+
+    Returns the cached /info payload (port, tool name, program name, date
+    prefix, plugin version) plus a human-readable label. Useful when several
+    ghidra-* MCP servers are loaded at once and you need to tell them apart.
+    """
+    return {
+        "label": program_label,
+        "ghidra_server": ghidra_server_url,
+        "info": program_info_cache,
+    }
+
+
+def _identify_program() -> None:
+    """
+    Hit /info once at startup, cache the payload, and stamp a human-readable
+    label into every registered tool's description plus the MCP server name.
+    This is how each bridge instance announces *which* Ghidra program it
+    represents, so Claude can tell ghidra-8090 (eqgame) from ghidra-8091
+    (eqmain) without making the user do per-port mental bookkeeping.
+
+    Failures are non-fatal — the bridge still serves; the label just falls
+    back to "<ghidra_server_url> (offline)" so the absence is visible.
+    """
+    global program_info_cache, program_label
+
+    info = {}
+    try:
+        url = urljoin(ghidra_server_url, "info")
+        resp = requests.get(url, timeout=2)
+        if resp.ok:
+            info = resp.json()
+    except Exception as e:
+        logger.warning(f"/info probe failed for {ghidra_server_url}: {e}")
+
+    program_info_cache = info
+
+    if info:
+        port = info.get("port", "?")
+        name = info.get("name") or "(no program loaded)"
+        date = info.get("datePrefix") or ""
+        # The plugin returns the FULL DomainFile name which often already starts
+        # with the date prefix (e.g. "6-9-2026-test-eqgame.exe"). When we have
+        # a canonical datePrefix to display, strip the leading date from name
+        # so the label reads "06-09-2026 test-eqgame.exe @ 8090" rather than
+        # "06-09-2026 6-9-2026-test-eqgame.exe @ 8090".
+        if date:
+            import re
+            name = re.sub(r"^\d{1,2}-\d{1,2}-\d{4}-", "", name)
+            program_label = f"{date} {name} @ {port}"
+        else:
+            program_label = f"{name} @ {port}"
+    else:
+        program_label = f"{ghidra_server_url} (offline)"
+
+    # Prepend label to every tool's description so it appears in Claude's
+    # tool catalog. Iterate via list_tools() to get the same objects the
+    # tool manager exposes to the protocol layer.
+    try:
+        prefix = f"[{program_label}] "
+        for tool in mcp._tool_manager.list_tools():
+            tool.description = prefix + (tool.description or "")
+    except Exception as e:
+        logger.warning(f"could not patch tool descriptions: {e}")
+
+    # Also override the server name. Many MCP clients display this in the
+    # tool list header, which makes the binding obvious at a glance.
+    try:
+        mcp._mcp_server.name = f"ghidra-mcp [{program_label}]"
+    except Exception as e:
+        logger.warning(f"could not patch server name: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
@@ -303,7 +385,11 @@ def main():
     global ghidra_server_url
     if args.ghidra_server:
         ghidra_server_url = args.ghidra_server
-    
+
+    # Probe /info and stamp the program identity into tool metadata so
+    # Claude can distinguish multiple ghidra-* MCP servers at a glance.
+    _identify_program()
+
     if args.transport == "sse":
         try:
             # Set up logging

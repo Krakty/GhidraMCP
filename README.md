@@ -291,6 +291,22 @@ The Python bridge translates MCP tool calls into HTTP requests against the
 plugin. It's a thin client — no business logic — and pairs one-to-one with a
 plugin endpoint per MCP tool.
 
+### Program-identity announcement
+
+At startup the bridge hits `/info` on its target port, builds a label of the
+form `MM-DD-YYYY program.ext @ <port>`, and stamps it into every tool's
+description plus the MCP `serverInfo.name`. With one bridge per port, an LLM
+client running against six bridges sees six distinctly labeled tool catalogs
+instead of six indistinguishable `ghidra-*` blocks, so it can answer
+"decompile X in the 06-09 eqgame build" without manual port juggling.
+
+Also exposes a `program_info` MCP tool that returns the cached label + raw
+`/info` payload for mid-session self-discovery.
+
+If `/info` is unreachable at startup (Ghidra not running on that port), the
+label falls back to `<url> (offline)` and the bridge still serves — endpoint
+calls will surface the unreachable upstream individually.
+
 ### Transports
 
 - `--transport stdio` (default) — MCP clients spawn the bridge per session.
