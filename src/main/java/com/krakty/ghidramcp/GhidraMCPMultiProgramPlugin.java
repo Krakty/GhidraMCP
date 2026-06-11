@@ -589,6 +589,49 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             sendJson(exchange, setFunctionSignatureBulk(params.get("text")));
         });
 
+        // Tier 1 PR 5: bookmarks + comment readback.
+        server.createContext("/list_bookmarks", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"),  200);
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            respondMaybeSpool(exchange, toFile, "bookmarks",
+                listBookmarks(offset, limit,
+                    qparams.get("category"), qparams.get("type")));
+        });
+
+        server.createContext("/add_bookmark", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, addBookmark(
+                params.get("address"),
+                params.get("type"),
+                params.get("category"),
+                params.get("note")));
+        });
+
+        server.createContext("/delete_bookmark", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, deleteBookmark(
+                params.get("address"),
+                params.get("type"),
+                params.get("category")));
+        });
+
+        server.createContext("/list_comments_for_function", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            respondMaybeSpool(exchange, toFile, "fn_comments",
+                listCommentsForFunction(qparams.get("address")));
+        });
+
+        // Tier 1 PR 6: callgraph.
+        server.createContext("/get_callgraph", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int depth = parseIntOrDefault(qparams.get("depth"), 2);
+            sendJson(exchange, getCallgraph(
+                qparams.get("address"), depth, qparams.get("direction")));
+        });
+
         // Spool fetch endpoints: GET /dump (list), GET/DELETE /dump/{uuid}.
         // The Java HttpServer uses longest-prefix matching; "/dump/" catches
         // ID requests, "/dump" catches the list path.
@@ -2904,6 +2947,287 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             if (!first) sb.append(',');
             first = false;
             sb.append('"').append(jsonEscape(e)).append('"');
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Bookmarks + comment readback + callgraph (Tier 1 PR 5 + 6)
+    // ----------------------------------------------------------------------------------
+
+    private String listBookmarks(int offset, int limit, String category, String type) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return listBookmarks(program, offset, limit, category, type);
+    }
+
+    /**
+     * Enumerate bookmarks. Format per line: {@code <addr> <type> <category> <comment>}.
+     * Filters are case-insensitive substring matches on type and category.
+     */
+    private String listBookmarks(Program program, int offset, int limit,
+                                 String categoryFilter, String typeFilter) {
+        if (program == null) return "No program loaded";
+        ghidra.program.model.listing.BookmarkManager bm = program.getBookmarkManager();
+        if (bm == null) return "no bookmark manager";
+
+        String catWant  = (categoryFilter != null && !categoryFilter.isEmpty())
+            ? categoryFilter.toLowerCase() : null;
+        String typeWant = (typeFilter != null && !typeFilter.isEmpty()
+            && !typeFilter.equalsIgnoreCase("all"))
+            ? typeFilter.toLowerCase() : null;
+
+        List<String> lines = new ArrayList<>();
+        java.util.Iterator<ghidra.program.model.listing.Bookmark> it = bm.getBookmarksIterator();
+        while (it.hasNext()) {
+            ghidra.program.model.listing.Bookmark bk = it.next();
+            if (bk == null) continue;
+            String btype = bk.getTypeString();
+            String cat   = bk.getCategory();
+            if (typeWant != null && !btype.toLowerCase().contains(typeWant)) continue;
+            if (catWant  != null && (cat == null || !cat.toLowerCase().contains(catWant))) continue;
+            String cm = bk.getComment();
+            lines.add(bk.getAddress() + " " + btype + " "
+                + (cat != null ? cat : "-") + " "
+                + (cm != null ? cm : ""));
+        }
+        Collections.sort(lines);
+        return paginateList(lines, offset, limit);
+    }
+
+    private String addBookmark(String addressStr, String type, String category, String note) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return addBookmark(program, addressStr, type, category, note);
+    }
+
+    /**
+     * Add or update a bookmark at {@code addressStr}. {@code type} is one of
+     * Ghidra's bookmark types (Note, Analysis, Error, Warning, Info); custom
+     * types are auto-created. {@code category} is a free-form subdivision the
+     * agent can use to group related bookmarks (e.g. "verified", "deferred",
+     * "needs_review").
+     */
+    private String addBookmark(Program program, String addressStr, String type,
+                               String category, String note) {
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "address required";
+        if (type == null || type.isEmpty()) type = "Note";
+        if (category == null) category = "";
+        if (note == null) note = "";
+        Address addr;
+        try { addr = program.getAddressFactory().getAddress(addressStr); }
+        catch (Exception e) { return "invalid address: " + addressStr; }
+        if (addr == null) return "invalid address: " + addressStr;
+
+        ghidra.program.model.listing.BookmarkManager bm = program.getBookmarkManager();
+        int tx = program.startTransaction("MCP add_bookmark");
+        boolean ok = false;
+        String error = null;
+        try {
+            // setBookmark auto-defines the type if it doesn't exist.
+            bm.setBookmark(addr, type, category, note);
+            ok = true;
+        }
+        catch (Exception e) { error = e.getMessage(); }
+        finally { program.endTransaction(tx, ok); }
+        return ok ? "added " + type + ":" + category + " bookmark at " + addr
+                  : "add failed: " + (error != null ? error : "unknown");
+    }
+
+    private String deleteBookmark(String addressStr, String type, String category) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return deleteBookmark(program, addressStr, type, category);
+    }
+
+    /**
+     * Delete the bookmark at {@code addressStr} matching {@code type} and
+     * {@code category}. {@code category} may be empty/null to match any
+     * category. {@code type} is required.
+     */
+    private String deleteBookmark(Program program, String addressStr,
+                                  String type, String category) {
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "address required";
+        if (type == null || type.isEmpty()) return "type required";
+        Address addr;
+        try { addr = program.getAddressFactory().getAddress(addressStr); }
+        catch (Exception e) { return "invalid address: " + addressStr; }
+        if (addr == null) return "invalid address: " + addressStr;
+
+        ghidra.program.model.listing.BookmarkManager bm = program.getBookmarkManager();
+        ghidra.program.model.listing.Bookmark[] candidates = bm.getBookmarks(addr, type);
+        int removed = 0;
+        int tx = program.startTransaction("MCP delete_bookmark");
+        try {
+            for (ghidra.program.model.listing.Bookmark bk : candidates) {
+                if (bk == null) continue;
+                if (category != null && !category.isEmpty()
+                    && !category.equals(bk.getCategory())) continue;
+                bm.removeBookmark(bk);
+                removed++;
+            }
+        }
+        finally { program.endTransaction(tx, true); }
+        return "removed " + removed + " bookmark(s) at " + addr;
+    }
+
+    private String listCommentsForFunction(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return listCommentsForFunction(program, addressStr);
+    }
+
+    /**
+     * Return all comments inside the function containing {@code addressStr},
+     * one line per comment as {@code <addr> <kind> <text>}. {@code kind} is
+     * one of PLATE/PRE/EOL/POST/REPEATABLE. The {@code text} is single-quoted
+     * with embedded newlines escaped as {@code \\n}.
+     */
+    private String listCommentsForFunction(Program program, String addressStr) {
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "address required";
+        Address addr;
+        try { addr = program.getAddressFactory().getAddress(addressStr); }
+        catch (Exception e) { return "invalid address: " + addressStr; }
+        if (addr == null) return "invalid address: " + addressStr;
+
+        Function fn = program.getFunctionManager().getFunctionContaining(addr);
+        if (fn == null) return "no function at " + addr;
+
+        Listing listing = program.getListing();
+        ghidra.program.model.address.AddressSetView body = fn.getBody();
+        int[] kinds = new int[] {
+            ghidra.program.model.listing.CodeUnit.PLATE_COMMENT,
+            ghidra.program.model.listing.CodeUnit.PRE_COMMENT,
+            ghidra.program.model.listing.CodeUnit.EOL_COMMENT,
+            ghidra.program.model.listing.CodeUnit.POST_COMMENT,
+            ghidra.program.model.listing.CodeUnit.REPEATABLE_COMMENT,
+        };
+        String[] kindNames = new String[] { "PLATE", "PRE", "EOL", "POST", "REPEATABLE" };
+
+        List<String> lines = new ArrayList<>();
+        ghidra.program.model.address.AddressIterator it = body.getAddresses(true);
+        while (it.hasNext()) {
+            Address a = it.next();
+            for (int i = 0; i < kinds.length; i++) {
+                String c = listing.getComment(kinds[i], a);
+                if (c != null && !c.isEmpty()) {
+                    lines.add(a + " " + kindNames[i] + " '"
+                        + c.replace("\\", "\\\\").replace("\n", "\\n") + "'");
+                }
+            }
+        }
+        if (lines.isEmpty()) return "no comments in function " + fn.getName();
+        return String.join("\n", lines);
+    }
+
+    private String getCallgraph(String addressStr, int depth, String direction) {
+        Program program = getCurrentProgram();
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        return getCallgraph(program, addressStr, depth, direction);
+    }
+
+    /**
+     * Walk the callgraph from the function at {@code addressStr} up to
+     * {@code depth} levels deep. {@code direction} is "callees" (functions
+     * this calls), "callers" (functions that call this), or "both".
+     *
+     * Returns a JSON envelope: {@code {root, direction, depth, nodes: [...]}}.
+     * Each node is {@code {address, name, depth, parents: [addresses]}}; the
+     * parents list is the call edges that brought you to this node.
+     */
+    private String getCallgraph(Program program, String addressStr, int depth, String direction) {
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        if (addressStr == null || addressStr.isEmpty()) {
+            return "{\"error\":\"address required\"}";
+        }
+        if (depth <= 0) depth = 1;
+        if (depth > 6) depth = 6;
+        String dir = (direction == null || direction.isEmpty())
+            ? "callees" : direction.toLowerCase();
+
+        Address addr;
+        try { addr = program.getAddressFactory().getAddress(addressStr); }
+        catch (Exception e) { return "{\"error\":\"invalid address\"}"; }
+        if (addr == null) return "{\"error\":\"invalid address\"}";
+
+        Function root = program.getFunctionManager().getFunctionAt(addr);
+        if (root == null) return "{\"error\":\"no function at " + addr + "\"}";
+
+        // BFS up to depth. Each node records its depth + the set of parents
+        // by which we discovered it (so the agent can see multiple call
+        // paths converging).
+        Map<Address, Integer> depthOf = new LinkedHashMap<>();
+        Map<Address, List<Address>> parentsOf = new HashMap<>();
+        Map<Address, Function> fnOf = new HashMap<>();
+        depthOf.put(root.getEntryPoint(), 0);
+        fnOf.put(root.getEntryPoint(), root);
+
+        List<Function> frontier = new ArrayList<>();
+        frontier.add(root);
+        ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+        for (int d = 1; d <= depth; d++) {
+            List<Function> next = new ArrayList<>();
+            for (Function f : frontier) {
+                java.util.Set<Function> neighbours = new java.util.HashSet<>();
+                try {
+                    if (dir.equals("callees") || dir.equals("both")) {
+                        neighbours.addAll(f.getCalledFunctions(monitor));
+                    }
+                    if (dir.equals("callers") || dir.equals("both")) {
+                        neighbours.addAll(f.getCallingFunctions(monitor));
+                    }
+                }
+                catch (Exception e) { /* skip on monitor errors */ }
+                for (Function n : neighbours) {
+                    if (n == null) continue;
+                    Address na = n.getEntryPoint();
+                    parentsOf.computeIfAbsent(na, k -> new ArrayList<>())
+                        .add(f.getEntryPoint());
+                    if (!depthOf.containsKey(na)) {
+                        depthOf.put(na, d);
+                        fnOf.put(na, n);
+                        next.add(n);
+                    }
+                }
+            }
+            frontier = next;
+            if (frontier.isEmpty()) break;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        sb.append("\"root\":\"").append(root.getEntryPoint()).append("\",");
+        sb.append("\"root_name\":\"").append(jsonEscape(root.getName())).append("\",");
+        sb.append("\"direction\":\"").append(dir).append("\",");
+        sb.append("\"depth\":").append(depth).append(',');
+        sb.append("\"nodes\":[");
+        boolean first = true;
+        for (Map.Entry<Address, Integer> e : depthOf.entrySet()) {
+            if (!first) sb.append(',');
+            first = false;
+            Address a = e.getKey();
+            Function f = fnOf.get(a);
+            sb.append('{');
+            sb.append("\"address\":\"").append(a).append("\",");
+            sb.append("\"name\":\"").append(jsonEscape(f != null ? f.getName() : "?"))
+              .append("\",");
+            sb.append("\"depth\":").append(e.getValue()).append(',');
+            sb.append("\"parents\":[");
+            List<Address> ps = parentsOf.get(a);
+            if (ps != null) {
+                boolean firstP = true;
+                for (Address pa : ps) {
+                    if (!firstP) sb.append(',');
+                    firstP = false;
+                    sb.append('"').append(pa).append('"');
+                }
+            }
+            sb.append(']');
+            sb.append('}');
         }
         sb.append("]}");
         return sb.toString();

@@ -639,6 +639,96 @@ def rename_functions_bulk(header: str, strip_suffix: str = None) -> dict:
 
 
 @mcp.tool()
+def list_bookmarks(offset: int = 0, limit: int = 200,
+                   category: str = None, type: str = None,
+                   to_file: bool = False):
+    """
+    Enumerate bookmarks in the program. One line per bookmark:
+    "<addr> <type> <category> <comment>".
+
+    Bookmarks are Ghidra's persistent annotation system — perfect for the
+    "deferred_placements" pattern (mark addresses for follow-up sessions
+    by category like "verified" / "needs_review" / "stop_condition").
+
+    Args:
+        category: case-insensitive substring filter on category
+        type:     case-insensitive substring filter on type (Note, Analysis,
+                  Error, Warning, Info, or a custom type)
+    """
+    params = {"offset": offset, "limit": limit}
+    if category: params["category"] = category
+    if type:     params["type"]     = type
+    if to_file:
+        params["to_file"] = "true"
+        return safe_get_json("list_bookmarks", params)
+    return safe_get("list_bookmarks", params)
+
+
+@mcp.tool()
+def add_bookmark(address: str, type: str = "Note",
+                 category: str = "", note: str = "") -> str:
+    """
+    Add or update a bookmark at <address>. <type> auto-creates if it doesn't
+    exist (Ghidra's defaults: Note, Analysis, Error, Warning, Info). Use
+    <category> as a free-form subdivision the agent can grep on later
+    (e.g. "verified", "deferred", "needs_review").
+    """
+    return safe_post("add_bookmark", {
+        "address": address, "type": type,
+        "category": category, "note": note,
+    })
+
+
+@mcp.tool()
+def delete_bookmark(address: str, type: str = "Note",
+                    category: str = None) -> str:
+    """
+    Delete the bookmark(s) at <address> matching <type> and (optionally)
+    <category>. Pass category=None to delete every bookmark of the given
+    type at that address.
+    """
+    payload = {"address": address, "type": type}
+    if category is not None: payload["category"] = category
+    return safe_post("delete_bookmark", payload)
+
+
+@mcp.tool()
+def list_comments_for_function(address: str, to_file: bool = False):
+    """
+    Return all comments inside the function containing <address>. One line
+    per comment: "<addr> <kind> '<text>'". Kind is PLATE / PRE / EOL / POST /
+    REPEATABLE. Text is single-quoted with embedded newlines escaped.
+
+    Closes the "evidence comments aren't readable back later" gap — the
+    MQ-RE workflow leaves a lot of decompiler-comment evidence; this lets
+    later sessions pick those up without manual grep.
+    """
+    params = {"address": address}
+    if to_file:
+        params["to_file"] = "true"
+        return safe_get_json("list_comments_for_function", params)
+    return safe_get("list_comments_for_function", params)
+
+
+@mcp.tool()
+def get_callgraph(address: str, depth: int = 2,
+                  direction: str = "callees") -> dict:
+    """
+    Walk the callgraph from the function at <address> up to <depth> levels
+    deep. <direction> is "callees", "callers", or "both". Depth is clamped
+    to 1..6.
+
+    Returns a JSON envelope with each reachable function as a node:
+    {address, name, depth, parents: [edges]}. Useful for Phase 5 STEP 0 in
+    the runbook (ctor-prove sub-object bases) — instead of chaining
+    individual get_xrefs_to calls, the whole local callgraph slice is one
+    request.
+    """
+    return safe_get_json("get_callgraph",
+        {"address": address, "depth": depth, "direction": direction})
+
+
+@mcp.tool()
 def set_function_signature_bulk(text: str) -> dict:
     """
     Bulk-apply function prototypes from a per-line input. Each line:

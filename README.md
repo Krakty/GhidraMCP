@@ -138,6 +138,11 @@ All endpoints are served on every bound port. They operate on
 | `/apply_labels_from_header`    | POST   | Bulk-rename / -label from #define-style C header |
 | `/rename_functions_bulk`       | POST   | Strict variant: rename functions only, report missing |
 | `/set_function_signature_bulk` | POST   | Bulk prototype apply from tab-separated text |
+| `/list_bookmarks`              | GET    | Enumerate bookmarks; filter type/category |
+| `/add_bookmark`                | POST   | Add/update a bookmark at address |
+| `/delete_bookmark`             | POST   | Remove bookmark(s) at address |
+| `/list_comments_for_function`  | GET    | All comments in a function body |
+| `/get_callgraph`                | GET    | BFS callgraph slice (callees/callers/both, depth-limited) |
 | `/dump/{uuid}`                 | GET    | Stream a spooled large response      |
 | `/dump/{uuid}`                 | DELETE | Explicit cleanup of a spooled file   |
 | `/dump`                        | GET    | List active spooled files            |
