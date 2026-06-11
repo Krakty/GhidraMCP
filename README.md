@@ -124,6 +124,9 @@ All endpoints are served on every bound port. They operate on
 | `/xrefs_from`                  | GET    | References out from an address       |
 | `/function_xrefs`              | GET    | References involving a function      |
 | `/strings`                     | GET    | Defined strings (`filter` supported) |
+| `/list_symbols`                | GET    | Whole SymbolTable; filter by `type`/`source` |
+| `/get_symbol_at`               | GET    | All symbols at an address (primary + aliases) |
+| `/delete_label`                | POST   | Remove a label by address and/or name |
 | `/dump/{uuid}`                 | GET    | Stream a spooled large response      |
 | `/dump/{uuid}`                 | DELETE | Explicit cleanup of a spooled file   |
 | `/dump`                        | GET    | List active spooled files            |

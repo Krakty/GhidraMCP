@@ -348,6 +348,76 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None,
         return safe_get_json("strings", params)
     return safe_get("strings", params)
 
+
+# ----------------------------------------------------------------------------
+# Tier 1 PR 1: symbol-table endpoints
+# ----------------------------------------------------------------------------
+
+@mcp.tool()
+def list_symbols(offset: int = 0, limit: int = 200,
+                 type: str = None, source: str = None,
+                 to_file: bool = False):
+    """
+    List every entry in the SymbolTable (the whole-program one — not just
+    defined Data). One line per symbol:
+
+        <address> <type> <source> [<namespace>::]<name>
+
+    Useful for verification sweeps where the legacy /data endpoint returned
+    nothing because bare labels created by rename_data don't show up there.
+
+    Args:
+        offset:  pagination offset (default 0)
+        limit:   max symbols to return (default 200)
+        type:    filter to one SymbolType — "function", "label", "parameter",
+                 "local_var", "global_var", "namespace", "class", "library".
+                 Case-insensitive; "all" or None means no filter.
+        source:  filter to one SourceType — "user_defined", "analysis",
+                 "imported", "default". Case-insensitive.
+        to_file: spool the result; see decompile_function for the curl
+                 pattern. Recommended for large binaries.
+    """
+    params = {"offset": offset, "limit": limit}
+    if type:   params["type"] = type
+    if source: params["source"] = source
+    if to_file:
+        params["to_file"] = "true"
+        return safe_get_json("list_symbols", params)
+    return safe_get("list_symbols", params)
+
+
+@mcp.tool()
+def get_symbol_at(address: str) -> list:
+    """
+    Return every symbol at the given address as a list of dicts. Empty list
+    if there's no symbol. There can be more than one (primary + aliases);
+    the dict's "primary" field flags which is which.
+
+    Each entry: {name, address, type, source, primary, namespace}.
+    """
+    res = safe_get_json("get_symbol_at", {"address": address})
+    # Server returns a JSON array; safe_get_json gives us the parsed value.
+    return res if isinstance(res, list) else [res]
+
+
+@mcp.tool()
+def delete_label(address: str = None, name: str = None) -> str:
+    """
+    Delete a label by address, name, or both. Either argument alone is
+    accepted; supplying both narrows the match (helpful when an address
+    carries multiple symbols).
+
+    Wraps the removal in a Ghidra transaction so the change is undoable
+    via Edit -> Undo in the GUI.
+
+    Returns a short text payload like "removed 1 of 1 matched".
+    """
+    payload = {}
+    if address: payload["address"] = address
+    if name:    payload["name"]    = name
+    return safe_post("delete_label", payload)
+
+
 @mcp.tool()
 def program_info() -> dict:
     """

@@ -470,6 +470,29 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
                 listDefinedStrings(offset, limit, filter));
         });
 
+        // Tier 1 PR 1: symbol-table endpoints.
+        server.createContext("/list_symbols", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"),  200);
+            String typeFilter   = qparams.get("type");
+            String sourceFilter = qparams.get("source");
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            respondMaybeSpool(exchange, toFile, "symbols",
+                listSymbols(offset, limit, typeFilter, sourceFilter));
+        });
+
+        server.createContext("/get_symbol_at", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJson(exchange, getSymbolAt(qparams.get("address")));
+        });
+
+        server.createContext("/delete_label", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange,
+                deleteLabel(params.get("address"), params.get("name")));
+        });
+
         // Spool fetch endpoints: GET /dump (list), GET/DELETE /dump/{uuid}.
         // The Java HttpServer uses longest-prefix matching; "/dump/" catches
         // ID requests, "/dump" catches the list path.
@@ -1675,6 +1698,216 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         }
 
         return paginateList(lines, offset, limit);
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Symbol-table endpoints (Tier 1 PR 1)
+    // ----------------------------------------------------------------------------------
+
+    private String listSymbols(int offset, int limit, String typeFilter, String sourceFilter) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return listSymbols(program, offset, limit, typeFilter, sourceFilter);
+    }
+
+    /**
+     * Walk every entry in the SymbolTable (the whole-program one, not just
+     * defined Data), optionally filter by symbol type or source. Returns one
+     * line per symbol:
+     *
+     * <pre>
+     * &lt;address&gt; &lt;type&gt; &lt;source&gt; &lt;namespace&gt;::&lt;name&gt;
+     * </pre>
+     *
+     * Address has no leading {@code 0x}; namespace is omitted when global.
+     * Designed to be greppable from the agent side; pair with {@code to_file=true}
+     * for large binaries.
+     *
+     * @param typeFilter case-insensitive {@link SymbolType} name, or null/empty/"all"
+     * @param sourceFilter case-insensitive {@link SourceType} name, or null/empty/"all"
+     */
+    private String listSymbols(Program program, int offset, int limit,
+                               String typeFilter, String sourceFilter) {
+        if (program == null) return "No program loaded";
+        SymbolTable table = program.getSymbolTable();
+        SymbolIterator it = table.getAllSymbols(true);
+
+        SymbolType wantType = parseSymbolType(typeFilter);
+        SourceType wantSource = parseSourceType(sourceFilter);
+
+        List<String> lines = new ArrayList<>();
+        while (it.hasNext()) {
+            Symbol s = it.next();
+            if (s == null) continue;
+            if (wantType != null && s.getSymbolType() != wantType) continue;
+            if (wantSource != null && s.getSource() != wantSource) continue;
+            lines.add(formatSymbolLine(s));
+        }
+        return paginateList(lines, offset, limit);
+    }
+
+    /** Format a Symbol as "<addr> <type> <source> <namespace>::<name>". */
+    private static String formatSymbolLine(Symbol s) {
+        Address addr = s.getAddress();
+        String addrStr = (addr != null) ? addr.toString() : "?";
+        Namespace ns = s.getParentNamespace();
+        String qual = (ns != null && !ns.isGlobal())
+            ? ns.getName(true) + "::" + s.getName()
+            : s.getName();
+        return addrStr + " " + s.getSymbolType().toString()
+            + " " + s.getSource().toString() + " " + qual;
+    }
+
+    /** Parse "function"/"label"/"all"/null into a {@link SymbolType}, or null for any. */
+    private static SymbolType parseSymbolType(String filter) {
+        if (filter == null || filter.isEmpty() || filter.equalsIgnoreCase("all")) {
+            return null;
+        }
+        String f = filter.toUpperCase();
+        switch (f) {
+            case "FUNCTION":   return SymbolType.FUNCTION;
+            case "LABEL":      return SymbolType.LABEL;
+            case "PARAMETER":  return SymbolType.PARAMETER;
+            case "LOCAL_VAR":  return SymbolType.LOCAL_VAR;
+            case "GLOBAL_VAR": return SymbolType.GLOBAL_VAR;
+            case "NAMESPACE":  return SymbolType.NAMESPACE;
+            case "CLASS":      return SymbolType.CLASS;
+            case "LIBRARY":    return SymbolType.LIBRARY;
+            default:           return null;  // unrecognised → no filter
+        }
+    }
+
+    /** Parse "user_defined"/"analysis"/"imported"/"default"/null. */
+    private static SourceType parseSourceType(String filter) {
+        if (filter == null || filter.isEmpty() || filter.equalsIgnoreCase("all")) {
+            return null;
+        }
+        String f = filter.toUpperCase();
+        switch (f) {
+            case "USER_DEFINED": return SourceType.USER_DEFINED;
+            case "ANALYSIS":     return SourceType.ANALYSIS;
+            case "IMPORTED":     return SourceType.IMPORTED;
+            case "DEFAULT":      return SourceType.DEFAULT;
+            default:             return null;
+        }
+    }
+
+    private String getSymbolAt(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        return getSymbolAt(program, addressStr);
+    }
+
+    /**
+     * Return every symbol at {@code addressStr} as a JSON array. There can be
+     * more than one (primary + aliases); the primary is flagged. Empty array
+     * means no symbol there.
+     */
+    private String getSymbolAt(Program program, String addressStr) {
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        if (addressStr == null || addressStr.isEmpty()) {
+            return "{\"error\":\"address parameter required\"}";
+        }
+        Address addr;
+        try {
+            addr = program.getAddressFactory().getAddress(addressStr);
+        }
+        catch (Exception e) {
+            return "{\"error\":\"invalid address: " + jsonEscape(addressStr) + "\"}";
+        }
+        if (addr == null) return "[]";
+
+        SymbolTable table = program.getSymbolTable();
+        Symbol[] syms = table.getSymbols(addr);
+        if (syms == null || syms.length == 0) return "[]";
+
+        StringBuilder sb = new StringBuilder();
+        sb.append('[');
+        boolean first = true;
+        for (Symbol s : syms) {
+            if (s == null) continue;
+            if (!first) sb.append(',');
+            first = false;
+            sb.append('{');
+            sb.append("\"name\":\"").append(jsonEscape(s.getName())).append("\",");
+            sb.append("\"address\":\"").append(s.getAddress()).append("\",");
+            sb.append("\"type\":\"").append(s.getSymbolType()).append("\",");
+            sb.append("\"source\":\"").append(s.getSource()).append("\",");
+            sb.append("\"primary\":").append(s.isPrimary()).append(',');
+            Namespace ns = s.getParentNamespace();
+            sb.append("\"namespace\":\"")
+              .append(jsonEscape(ns != null ? ns.getName(true) : ""))
+              .append("\"");
+            sb.append('}');
+        }
+        sb.append(']');
+        return sb.toString();
+    }
+
+    private String deleteLabel(String addressStr, String name) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return deleteLabel(program, addressStr, name);
+    }
+
+    /**
+     * Delete a label by address, name, or both. Either parameter alone is
+     * accepted; supplying both narrows the match. Wraps the removal in a
+     * transaction so the operation is undoable in Ghidra's GUI.
+     *
+     * Returns the count of symbols removed as a short text payload.
+     */
+    private String deleteLabel(Program program, String addressStr, String name) {
+        if (program == null) return "No program loaded";
+        if ((addressStr == null || addressStr.isEmpty())
+            && (name == null || name.isEmpty())) {
+            return "Specify address and/or name";
+        }
+
+        SymbolTable table = program.getSymbolTable();
+        List<Symbol> targets = new ArrayList<>();
+
+        if (addressStr != null && !addressStr.isEmpty()) {
+            Address addr;
+            try { addr = program.getAddressFactory().getAddress(addressStr); }
+            catch (Exception e) { return "invalid address: " + addressStr; }
+            if (addr == null) return "invalid address: " + addressStr;
+            Symbol[] at = table.getSymbols(addr);
+            if (at != null) {
+                for (Symbol s : at) {
+                    if (s == null) continue;
+                    if (name == null || name.isEmpty() || name.equals(s.getName())) {
+                        targets.add(s);
+                    }
+                }
+            }
+        }
+        else {
+            // name-only path: walk every namespace lookup
+            SymbolIterator iter = table.getSymbols(name);
+            while (iter.hasNext()) {
+                Symbol s = iter.next();
+                if (s != null) targets.add(s);
+            }
+        }
+
+        if (targets.isEmpty()) return "0 symbols matched";
+
+        int tx = program.startTransaction("MCP delete_label");
+        int removed = 0;
+        try {
+            for (Symbol s : targets) {
+                // removeSymbolSpecial wraps the per-type rules
+                // (e.g. won't kill a primary function symbol that owns a Function).
+                if (s.delete()) removed++;
+            }
+            program.endTransaction(tx, true);
+        }
+        catch (Exception e) {
+            program.endTransaction(tx, false);
+            return "delete failed: " + e.getMessage();
+        }
+        return "removed " + removed + " of " + targets.size() + " matched";
     }
 
     /**
