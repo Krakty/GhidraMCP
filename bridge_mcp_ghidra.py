@@ -72,6 +72,28 @@ def safe_get_json(endpoint: str, params: dict = None) -> dict:
         return {"error": f"Request failed: {e}"}
 
 
+def safe_post_json(endpoint: str, data: dict | str) -> dict:
+    """
+    POST <endpoint> and parse the response as JSON. Used by bulk endpoints
+    that return structured envelopes. On HTTP or decode error, returns
+    {"error": "..."}.
+    """
+    url = urljoin(ghidra_server_url, endpoint)
+    try:
+        if isinstance(data, dict):
+            response = requests.post(url, data=data, timeout=60)
+        else:
+            response = requests.post(url, data=data.encode("utf-8"), timeout=60)
+        response.encoding = "utf-8"
+        if not response.ok:
+            return {"error": f"HTTP {response.status_code}: {response.text.strip()}"}
+        return response.json()
+    except ValueError as e:
+        return {"error": f"JSON decode failed: {e}"}
+    except Exception as e:
+        return {"error": f"Request failed: {e}"}
+
+
 def safe_post(endpoint: str, data: dict | str) -> str:
     try:
         url = urljoin(ghidra_server_url, endpoint)
@@ -566,6 +588,71 @@ def list_data_types(offset: int = 0, limit: int = 200,
         params["to_file"] = "true"
         return safe_get_json("list_data_types", params)
     return safe_get("list_data_types", params)
+
+
+@mcp.tool()
+def apply_labels_from_header(header: str,
+                             strip_suffix: str = None,
+                             create_if_missing: bool = True) -> dict:
+    """
+    Bulk-apply #define NAME ADDR pairs in a C-style header as function
+    renames and/or data labels. Replaces the external ApplyEqgameLabels.py
+    Jython tool documented in MQ-RE's TOOLS_MATRIX.md.
+
+    For each parsed #define:
+      - If a function exists at ADDR: rename it (function-name promotion).
+      - Else if any symbol exists at ADDR: rename the primary symbol.
+      - Else if create_if_missing: create a USER_DEFINED label at ADDR.
+      - Else: count as skipped.
+
+    Args:
+        header:           C-style header text with #define lines.
+        strip_suffix:     trailing string to strip from each NAME (e.g. "_x").
+        create_if_missing: when True, addresses with no existing symbol get
+                          a new USER_DEFINED label. When False, they're
+                          counted as skipped instead.
+
+    Returns: {parsed, renamed_functions, renamed_symbols, created_labels,
+              skipped, errors: [...]}.
+    """
+    payload = {"header": header}
+    if strip_suffix is not None:
+        payload["strip_suffix"] = strip_suffix
+    payload["create_if_missing"] = "true" if create_if_missing else "false"
+    return safe_post_json("apply_labels_from_header", payload)
+
+
+@mcp.tool()
+def rename_functions_bulk(header: str, strip_suffix: str = None) -> dict:
+    """
+    Strict variant of apply_labels_from_header: only renames addresses that
+    are already classified as functions. Addresses that aren't functions are
+    reported in the "missing" list — useful as input for a follow-up
+    create_function pass.
+
+    Returns: {parsed, renamed, missing: [...], errors: [...]}.
+    """
+    payload = {"header": header}
+    if strip_suffix is not None:
+        payload["strip_suffix"] = strip_suffix
+    return safe_post_json("rename_functions_bulk", payload)
+
+
+@mcp.tool()
+def set_function_signature_bulk(text: str) -> dict:
+    """
+    Bulk-apply function prototypes from a per-line input. Each line:
+
+        <address>\\t<prototype>
+
+    Tab-separated, with prototype in standard C declaration form. Lines
+    beginning with # or // are skipped. Each prototype is processed by the
+    same logic as set_function_prototype, wrapped in a single transaction
+    so the batch is atomic.
+
+    Returns: {parsed, applied, errors: [...]}.
+    """
+    return safe_post_json("set_function_signature_bulk", {"text": text})
 
 
 @mcp.tool()

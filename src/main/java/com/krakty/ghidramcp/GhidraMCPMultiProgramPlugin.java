@@ -566,6 +566,29 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
                 params.get("comment")));
         });
 
+        // Tier 1 PR 4: bulk operations.
+        server.createContext("/apply_labels_from_header", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String header = params.get("header");
+            String stripSuffix = params.get("strip_suffix");
+            String createMissing = params.get("create_if_missing");
+            boolean createIfMissing =
+                (createMissing == null) || createMissing.equalsIgnoreCase("true");
+            sendJson(exchange, applyLabelsFromHeader(
+                header, stripSuffix, createIfMissing));
+        });
+
+        server.createContext("/rename_functions_bulk", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJson(exchange, renameFunctionsBulk(
+                params.get("header"), params.get("strip_suffix")));
+        });
+
+        server.createContext("/set_function_signature_bulk", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJson(exchange, setFunctionSignatureBulk(params.get("text")));
+        });
+
         // Spool fetch endpoints: GET /dump (list), GET/DELETE /dump/{uuid}.
         // The Java HttpServer uses longest-prefix matching; "/dump/" catches
         // ID requests, "/dump" catches the list path.
@@ -2564,6 +2587,326 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         }
         return "set member at offset 0x" + Integer.toHexString(target.getOffset())
             + " in " + s.getPathName();
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Bulk operations (Tier 1 PR 4)
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * One {@code #define NAME ADDR} pair extracted from a header.
+     */
+    private static final class DefinePair {
+        final String name;
+        final long address;
+        DefinePair(String name, long address) { this.name = name; this.address = address; }
+    }
+
+    /**
+     * Parse {@code #define NAME ADDR} lines from a C-style header. Handles:
+     * <ul>
+     * <li>{@code #define DoCommand 0x140b80e10}</li>
+     * <li>{@code #define DoCommand (0x140b80e10)}</li>
+     * <li>{@code #define DoCommand        0X140B80E10  // comment}</li>
+     * <li>plain decimal addresses (no 0x prefix)</li>
+     * </ul>
+     * Lines that don't match are silently skipped; the caller surfaces them
+     * to the agent if needed via the line count delta.
+     */
+    private static final java.util.regex.Pattern DEFINE_LINE =
+        java.util.regex.Pattern.compile(
+            "^\\s*#\\s*define\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+\\(?\\s*"
+            + "(?:0[xX]([0-9A-Fa-f]+)|([0-9]+))\\s*\\)?\\s*(?:/\\*.*?\\*/|//.*)?\\s*$");
+
+    private static List<DefinePair> parseDefinePairs(String headerText) {
+        List<DefinePair> out = new ArrayList<>();
+        if (headerText == null) return out;
+        for (String line : headerText.split("\\r?\\n")) {
+            java.util.regex.Matcher m = DEFINE_LINE.matcher(line);
+            if (!m.matches()) continue;
+            String name = m.group(1);
+            String hex = m.group(2);
+            String dec = m.group(3);
+            long addr;
+            try {
+                addr = (hex != null)
+                    ? Long.parseUnsignedLong(hex, 16)
+                    : Long.parseUnsignedLong(dec, 10);
+            }
+            catch (NumberFormatException e) {
+                continue;
+            }
+            out.add(new DefinePair(name, addr));
+        }
+        return out;
+    }
+
+    /**
+     * Apply a stripping rule to a name. Currently supports trailing-suffix
+     * stripping: if {@code rule} is non-empty and {@code name} ends with it,
+     * remove it. Future enhancements can add prefix-strip / regex.
+     */
+    private static String applyNameRule(String name, String stripSuffix) {
+        if (stripSuffix == null || stripSuffix.isEmpty()) return name;
+        return name.endsWith(stripSuffix)
+            ? name.substring(0, name.length() - stripSuffix.length())
+            : name;
+    }
+
+    private String applyLabelsFromHeader(String headerText,
+                                         String stripSuffix,
+                                         boolean createIfMissing) {
+        Program program = getCurrentProgram();
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        return applyLabelsFromHeader(program, headerText, stripSuffix, createIfMissing);
+    }
+
+    /**
+     * Bulk-apply the {@code #define NAME ADDR} pairs in {@code headerText} as
+     * function renames / data labels. Mirrors the workflow of MQ-RE's
+     * external ApplyEqgameLabels.py — replaces the GUI-only Jython round-trip.
+     *
+     * For each parsed pair:
+     * <ol>
+     * <li>Resolve ADDR in the program's address factory.</li>
+     * <li>If a function exists at ADDR: rename the function's primary symbol
+     *     to NAME (this is "function-name promotion" in the runbook).</li>
+     * <li>Else if any symbol exists at ADDR: rename the primary symbol.</li>
+     * <li>Else if {@code createIfMissing}: create a USER_DEFINED label.</li>
+     * <li>Else: count as skipped.</li>
+     * </ol>
+     *
+     * Wrapped in a single transaction so individual failures don't break the batch.
+     */
+    private String applyLabelsFromHeader(Program program, String headerText,
+                                         String stripSuffix,
+                                         boolean createIfMissing) {
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        if (headerText == null || headerText.isEmpty()) {
+            return "{\"error\":\"header text required\"}";
+        }
+        List<DefinePair> pairs = parseDefinePairs(headerText);
+        if (pairs.isEmpty()) {
+            return "{\"parsed\":0,\"renamed_functions\":0,\"renamed_symbols\":0,"
+                + "\"created_labels\":0,\"skipped\":0,\"errors\":[]}";
+        }
+
+        int renamedFunctions = 0;
+        int renamedSymbols = 0;
+        int createdLabels = 0;
+        int skipped = 0;
+        List<String> errors = new ArrayList<>();
+
+        SymbolTable symTable = program.getSymbolTable();
+        FunctionManager fm = program.getFunctionManager();
+
+        int tx = program.startTransaction("MCP apply_labels_from_header");
+        try {
+            for (DefinePair p : pairs) {
+                Address addr;
+                try { addr = program.getAddressFactory().getDefaultAddressSpace()
+                        .getAddress(p.address); }
+                catch (Exception e) {
+                    errors.add(formatBulkError(p.name, p.address,
+                        "address conversion: " + e.getMessage()));
+                    continue;
+                }
+                if (addr == null) {
+                    errors.add(formatBulkError(p.name, p.address, "address null"));
+                    continue;
+                }
+                String name = applyNameRule(p.name, stripSuffix);
+
+                try {
+                    Function fn = fm.getFunctionAt(addr);
+                    if (fn != null) {
+                        fn.setName(name, SourceType.USER_DEFINED);
+                        renamedFunctions++;
+                        continue;
+                    }
+                    Symbol primary = symTable.getPrimarySymbol(addr);
+                    if (primary != null) {
+                        primary.setName(name, SourceType.USER_DEFINED);
+                        renamedSymbols++;
+                        continue;
+                    }
+                    if (createIfMissing) {
+                        symTable.createLabel(addr, name, SourceType.USER_DEFINED);
+                        createdLabels++;
+                    }
+                    else {
+                        skipped++;
+                    }
+                }
+                catch (Exception e) {
+                    errors.add(formatBulkError(p.name, p.address, e.getMessage()));
+                }
+            }
+        }
+        finally {
+            program.endTransaction(tx, true);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        sb.append("\"parsed\":").append(pairs.size()).append(',');
+        sb.append("\"renamed_functions\":").append(renamedFunctions).append(',');
+        sb.append("\"renamed_symbols\":").append(renamedSymbols).append(',');
+        sb.append("\"created_labels\":").append(createdLabels).append(',');
+        sb.append("\"skipped\":").append(skipped).append(',');
+        sb.append("\"errors\":[");
+        boolean first = true;
+        for (String err : errors) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append('"').append(jsonEscape(err)).append('"');
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    private static String formatBulkError(String name, long addr, String msg) {
+        return name + " @ 0x" + Long.toHexString(addr) + ": " + msg;
+    }
+
+    private String renameFunctionsBulk(String headerText, String stripSuffix) {
+        Program program = getCurrentProgram();
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        return renameFunctionsBulk(program, headerText, stripSuffix);
+    }
+
+    /**
+     * Strict variant of apply_labels_from_header: rename function-at-address
+     * only. Addresses that aren't already functions are reported in the
+     * {@code missing} list, not silently labeled. Useful when the caller
+     * wants to know exactly what got promoted and what didn't (e.g., for
+     * driving a follow-up create_function pass on the missing entries).
+     */
+    private String renameFunctionsBulk(Program program, String headerText, String stripSuffix) {
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        if (headerText == null || headerText.isEmpty()) {
+            return "{\"error\":\"header text required\"}";
+        }
+        List<DefinePair> pairs = parseDefinePairs(headerText);
+
+        int renamed = 0;
+        List<String> missing = new ArrayList<>();
+        List<String> errors = new ArrayList<>();
+
+        FunctionManager fm = program.getFunctionManager();
+        int tx = program.startTransaction("MCP rename_functions_bulk");
+        try {
+            for (DefinePair p : pairs) {
+                Address addr;
+                try { addr = program.getAddressFactory().getDefaultAddressSpace()
+                        .getAddress(p.address); }
+                catch (Exception e) {
+                    errors.add(formatBulkError(p.name, p.address,
+                        "address conversion: " + e.getMessage()));
+                    continue;
+                }
+                Function fn = fm.getFunctionAt(addr);
+                if (fn == null) {
+                    missing.add(formatBulkError(p.name, p.address, "not a function"));
+                    continue;
+                }
+                String name = applyNameRule(p.name, stripSuffix);
+                try {
+                    fn.setName(name, SourceType.USER_DEFINED);
+                    renamed++;
+                }
+                catch (Exception e) {
+                    errors.add(formatBulkError(p.name, p.address, e.getMessage()));
+                }
+            }
+        }
+        finally {
+            program.endTransaction(tx, true);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        sb.append("\"parsed\":").append(pairs.size()).append(',');
+        sb.append("\"renamed\":").append(renamed).append(',');
+        sb.append("\"missing\":[");
+        boolean first = true;
+        for (String m : missing) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append('"').append(jsonEscape(m)).append('"');
+        }
+        sb.append("],\"errors\":[");
+        first = true;
+        for (String err : errors) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append('"').append(jsonEscape(err)).append('"');
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    private String setFunctionSignatureBulk(String text) {
+        Program program = getCurrentProgram();
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        return setFunctionSignatureBulk(program, text);
+    }
+
+    /**
+     * Apply prototypes from a {@code &lt;address&gt;\t&lt;prototype&gt;} per
+     * line input. Each prototype is processed by the same logic as
+     * {@code /set_function_prototype}. Lines that don't contain a tab are
+     * skipped.
+     *
+     * Wrapped in a single transaction.
+     */
+    private String setFunctionSignatureBulk(Program program, String text) {
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        if (text == null || text.isEmpty()) {
+            return "{\"error\":\"text required\"}";
+        }
+
+        int applied = 0;
+        int parsed = 0;
+        List<String> errors = new ArrayList<>();
+
+        int tx = program.startTransaction("MCP set_function_signature_bulk");
+        try {
+            for (String line : text.split("\\r?\\n")) {
+                if (line.isEmpty() || line.startsWith("#") || line.startsWith("//")) continue;
+                int tab = line.indexOf('\t');
+                if (tab < 0) continue;
+                String addrStr = line.substring(0, tab).trim();
+                String prototype = line.substring(tab + 1).trim();
+                if (addrStr.isEmpty() || prototype.isEmpty()) continue;
+                parsed++;
+                PrototypeResult r = setFunctionPrototype(program, addrStr, prototype);
+                if (r != null && r.isSuccess()) {
+                    applied++;
+                }
+                else {
+                    errors.add(addrStr + ": "
+                        + (r != null ? r.getErrorMessage() : "unknown"));
+                }
+            }
+        }
+        finally {
+            program.endTransaction(tx, true);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        sb.append("\"parsed\":").append(parsed).append(',');
+        sb.append("\"applied\":").append(applied).append(',');
+        sb.append("\"errors\":[");
+        boolean first = true;
+        for (String e : errors) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append('"').append(jsonEscape(e)).append('"');
+        }
+        sb.append("]}");
+        return sb.toString();
     }
 
     /**

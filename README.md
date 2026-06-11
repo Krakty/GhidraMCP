@@ -135,6 +135,9 @@ All endpoints are served on every bound port. They operate on
 | `/get_data_type`               | GET    | Return type definition (members for structs) |
 | `/list_data_types`             | GET    | Enumerate DTM with filters |
 | `/set_struct_member`           | POST   | Rename/retype/comment one struct member |
+| `/apply_labels_from_header`    | POST   | Bulk-rename / -label from #define-style C header |
+| `/rename_functions_bulk`       | POST   | Strict variant: rename functions only, report missing |
+| `/set_function_signature_bulk` | POST   | Bulk prototype apply from tab-separated text |
 | `/dump/{uuid}`                 | GET    | Stream a spooled large response      |
 | `/dump/{uuid}`                 | DELETE | Explicit cleanup of a spooled file   |
 | `/dump`                        | GET    | List active spooled files            |
