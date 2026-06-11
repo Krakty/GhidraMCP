@@ -40,8 +40,13 @@ import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.data.DataTypeComponent;
 import ghidra.program.model.data.PointerDataType;
+import ghidra.program.model.data.Structure;
 import ghidra.program.model.data.Undefined1DataType;
+import ghidra.app.util.cparser.C.CParser;
+import ghidra.app.util.cparser.C.ParseException;
+import java.io.ByteArrayInputStream;
 import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
@@ -510,6 +515,55 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, markFunctionThunk(
                 params.get("address"), params.get("target")));
+        });
+
+        // Tier 1 PR 3: DataType endpoints.
+        server.createContext("/parse_c_header", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJson(exchange, parseCHeader(params.get("header")));
+        });
+
+        server.createContext("/apply_data_type_at", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String clear = params.get("clear");
+            boolean clearFirst = (clear == null) || clear.equalsIgnoreCase("true");
+            sendResponse(exchange, applyDataTypeAt(
+                params.get("address"), params.get("type"), clearFirst));
+        });
+
+        server.createContext("/get_data_type", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            String body = getDataType(qparams.get("name"));
+            if (toFile) {
+                respondMaybeSpool(exchange, true, "dtype", body);
+            }
+            else {
+                sendJson(exchange, body);
+            }
+        });
+
+        server.createContext("/list_data_types", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"),  200);
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            respondMaybeSpool(exchange, toFile, "dtypes",
+                listDataTypes(offset, limit,
+                    qparams.get("category"),
+                    qparams.get("pattern"),
+                    qparams.get("kind")));
+        });
+
+        server.createContext("/set_struct_member", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, setStructMember(
+                params.get("struct"),
+                params.get("offset"),
+                params.get("current_name"),
+                params.get("new_name"),
+                params.get("new_type"),
+                params.get("comment")));
         });
 
         // Spool fetch endpoints: GET /dump (list), GET/DELETE /dump/{uuid}.
@@ -2080,6 +2134,436 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             ? "cleared thunk at " + addr
             : "marked " + addr + " (" + fn.getName() + ") as thunk -> "
                 + targetAddr + " (" + target.getName() + ")";
+    }
+
+    // ----------------------------------------------------------------------------------
+    // DataType endpoints (Tier 1 PR 3)
+    // ----------------------------------------------------------------------------------
+
+    private String parseCHeader(String headerText) {
+        Program program = getCurrentProgram();
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        return parseCHeader(program, headerText);
+    }
+
+    /**
+     * Parse the given C source into the program's DataTypeManager. Uses the
+     * same {@link CParser} as Ghidra's GUI {@code File -> Parse C Source}.
+     * CParser builds its own type maps as it parses; we then iterate those
+     * maps and explicitly {@link DataTypeManager#addDataType} each one — the
+     * implicit "add as you go" behaviour the API name suggests doesn't
+     * actually happen.
+     *
+     * Forward-declared / referenced types not yet present get created as
+     * opaque/undefined and listed in the response so the agent knows what to
+     * fill in next. Transaction-wrapped.
+     */
+    private String parseCHeader(Program program, String headerText) {
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        if (headerText == null || headerText.isEmpty()) {
+            return "{\"error\":\"header text required\"}";
+        }
+        DataTypeManager dtm = program.getDataTypeManager();
+
+        int tx = program.startTransaction("MCP parse_c_header");
+        boolean success = false;
+        String errorMsg = null;
+        String parseMessages = null;
+        List<String> added = new ArrayList<>();
+        try {
+            CParser parser = new CParser(dtm);
+            parser.parse(new ByteArrayInputStream(
+                headerText.getBytes(StandardCharsets.UTF_8)));
+            success = parser.didParseSucceed();
+            parseMessages = parser.getParseMessages();
+
+            // Commit each parsed type to the DTM. CParser collects them in
+            // these per-kind maps but doesn't add them itself.
+            ghidra.program.model.data.DataTypeConflictHandler handler =
+                ghidra.program.model.data.DataTypeConflictHandler.REPLACE_HANDLER;
+            commitParsedTypes(dtm, parser.getComposites(),   handler, added);
+            commitParsedTypes(dtm, parser.getEnums(),        handler, added);
+            commitParsedTypes(dtm, parser.getDeclarations(), handler, added);
+            commitParsedTypes(dtm, parser.getTypes(),        handler, added);
+            commitParsedTypes(dtm, parser.getFunctions(),    handler, added);
+        }
+        catch (ParseException e) {
+            errorMsg = e.getMessage();
+            success = false;
+        }
+        catch (Exception e) {
+            errorMsg = "unexpected: " + e.getMessage();
+            success = false;
+        }
+        finally {
+            program.endTransaction(tx, success);
+        }
+        Collections.sort(added);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        sb.append("\"successful\":").append(success).append(',');
+        sb.append("\"added\":[");
+        boolean first = true;
+        for (String p : added) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append('"').append(jsonEscape(p)).append('"');
+        }
+        sb.append("],");
+        sb.append("\"added_count\":").append(added.size());
+        if (parseMessages != null && !parseMessages.isEmpty()) {
+            sb.append(",\"messages\":\"")
+              .append(jsonEscape(parseMessages)).append('"');
+        }
+        if (errorMsg != null) {
+            sb.append(",\"error\":\"").append(jsonEscape(errorMsg)).append('"');
+        }
+        sb.append('}');
+        return sb.toString();
+    }
+
+    /**
+     * Add each entry in {@code parsedMap} to {@code dtm} using {@code handler}
+     * for collision resolution, and record the final pathname of each
+     * successful add in {@code addedOut}. Failures are best-effort: a type
+     * that can't be added (already exists with conflicts, etc.) is skipped
+     * rather than aborting the whole parse.
+     */
+    private static void commitParsedTypes(DataTypeManager dtm,
+        java.util.Map<String, DataType> parsedMap,
+        ghidra.program.model.data.DataTypeConflictHandler handler,
+        List<String> addedOut)
+    {
+        if (parsedMap == null) return;
+        for (DataType dt : parsedMap.values()) {
+            if (dt == null) continue;
+            try {
+                DataType resolved = dtm.addDataType(dt, handler);
+                if (resolved != null) {
+                    String p = resolved.getPathName();
+                    if (!addedOut.contains(p)) addedOut.add(p);
+                }
+            }
+            catch (Exception e) {
+                // log + skip — best-effort commit per type
+                Msg.warn(GhidraMCPMultiProgramPlugin.class,
+                    "parse_c_header: skipped " + dt.getName()
+                        + ": " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Strict type resolver for the Tier 1 PR 3 endpoints. Unlike
+     * {@link #resolveDataType}, this returns {@code null} on miss instead of
+     * silently falling back to {@code int}/{@code void*}. Handles trailing
+     * {@code *}s as pointer wrappers (so {@code "CXWnd*"} resolves to a
+     * pointer to {@code /CXWnd}).
+     */
+    private DataType resolveDataTypeStrict(DataTypeManager dtm, String typeName) {
+        if (dtm == null || typeName == null) return null;
+        String t = typeName.trim();
+        if (t.isEmpty()) return null;
+
+        // Strip and count trailing '*' for pointer levels.
+        int ptrLevels = 0;
+        while (t.endsWith("*")) {
+            ptrLevels++;
+            t = t.substring(0, t.length() - 1).trim();
+        }
+        if (t.isEmpty()) return null;
+
+        DataType base = findDataTypeByNameInAllCategories(dtm, t);
+        if (base == null) {
+            base = dtm.getDataType("/" + t);
+        }
+        if (base == null && t.startsWith("/")) {
+            base = dtm.getDataType(t);
+        }
+        if (base == null) return null;
+
+        // Use the dtm-bound constructor so the pointer picks up the program's
+        // default pointer size (8 bytes on x64, 4 on x86). Without the dtm
+        // the constructor falls back to a 4-byte pointer regardless of arch.
+        for (int i = 0; i < ptrLevels; i++) {
+            base = new PointerDataType(base, dtm);
+        }
+        return base;
+    }
+
+    private String applyDataTypeAt(String addressStr, String typeName, boolean clearFirst) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return applyDataTypeAt(program, addressStr, typeName, clearFirst);
+    }
+
+    /**
+     * Apply a named type from the DTM at {@code addressStr}. When
+     * {@code clearFirst} is true (the default), existing code units in the
+     * affected range are cleared first so the apply is idempotent. The
+     * underlying {@code Listing.createData} is wrapped in a transaction.
+     */
+    private String applyDataTypeAt(Program program, String addressStr,
+                                   String typeName, boolean clearFirst) {
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) {
+            return "address parameter required";
+        }
+        if (typeName == null || typeName.isEmpty()) {
+            return "type parameter required";
+        }
+        Address addr;
+        try { addr = program.getAddressFactory().getAddress(addressStr); }
+        catch (Exception e) { return "invalid address: " + addressStr; }
+        if (addr == null) return "invalid address: " + addressStr;
+
+        DataTypeManager dtm = program.getDataTypeManager();
+        DataType dt = resolveDataTypeStrict(dtm, typeName);
+        if (dt == null) return "type not found: " + typeName;
+
+        int len = dt.getLength();
+        if (len <= 0) {
+            return "type has unknown size: " + typeName;
+        }
+
+        int tx = program.startTransaction("MCP apply_data_type_at");
+        try {
+            if (clearFirst) {
+                Address end;
+                try { end = addr.add(len - 1); }
+                catch (Exception e) { return "address arithmetic failed"; }
+                program.getListing().clearCodeUnits(addr, end, false);
+            }
+            Data data = program.getListing().createData(addr, dt);
+            program.endTransaction(tx, data != null);
+            if (data == null) {
+                return "createData returned null (conflicting data at " + addr + "?)";
+            }
+            return "applied " + dt.getPathName() + " at " + addr
+                + " (" + len + " bytes)";
+        }
+        catch (Exception e) {
+            program.endTransaction(tx, false);
+            return "apply failed: " + e.getMessage();
+        }
+    }
+
+    private String getDataType(String typeName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        return getDataType(program, typeName);
+    }
+
+    /**
+     * Return a JSON description of {@code typeName}. For Structures, the
+     * "members" array lists every field with offset, name, type pathname,
+     * length, and optional comment. For other DataTypes the response is a
+     * compact descriptor.
+     */
+    private String getDataType(Program program, String typeName) {
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        if (typeName == null || typeName.isEmpty()) {
+            return "{\"error\":\"name required\"}";
+        }
+        DataTypeManager dtm = program.getDataTypeManager();
+        DataType dt = resolveDataTypeStrict(dtm, typeName);
+        if (dt == null) {
+            return "{\"error\":\"type not found: " + jsonEscape(typeName) + "\"}";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        sb.append("\"name\":\"").append(jsonEscape(dt.getName())).append("\",");
+        sb.append("\"path\":\"").append(jsonEscape(dt.getPathName())).append("\",");
+        sb.append("\"kind\":\"").append(jsonEscape(dt.getClass().getSimpleName())).append("\",");
+        sb.append("\"length\":").append(dt.getLength());
+        if (dt instanceof Structure) {
+            Structure s = (Structure) dt;
+            sb.append(",\"members\":[");
+            boolean first = true;
+            for (DataTypeComponent c : s.getDefinedComponents()) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append('{');
+                sb.append("\"offset\":").append(c.getOffset()).append(',');
+                sb.append("\"ordinal\":").append(c.getOrdinal()).append(',');
+                String fname = c.getFieldName();
+                sb.append("\"name\":\"").append(jsonEscape(fname != null ? fname : ""))
+                  .append("\",");
+                DataType ct = c.getDataType();
+                sb.append("\"type\":\"")
+                  .append(jsonEscape(ct != null ? ct.getPathName() : "?"))
+                  .append("\",");
+                sb.append("\"length\":").append(c.getLength());
+                String cm = c.getComment();
+                if (cm != null && !cm.isEmpty()) {
+                    sb.append(",\"comment\":\"").append(jsonEscape(cm)).append('"');
+                }
+                sb.append('}');
+            }
+            sb.append(']');
+        }
+        sb.append('}');
+        return sb.toString();
+    }
+
+    private String listDataTypes(int offset, int limit, String category,
+                                 String pattern, String kind) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return listDataTypes(program, offset, limit, category, pattern, kind);
+    }
+
+    /**
+     * Enumerate the DTM, optionally filtered. Output is one line per type:
+     *
+     * <pre>
+     * &lt;path&gt; &lt;kind&gt; &lt;length&gt;
+     * </pre>
+     *
+     * Designed for greppability; pair with {@code to_file=true} for full dumps.
+     *
+     * @param category category-path prefix to filter on (e.g. {@code /MyHdr})
+     * @param pattern  case-insensitive substring match against the pathname
+     * @param kind     case-insensitive substring of the DataType class name
+     *                 (e.g. {@code structure}, {@code enum}, {@code typedef})
+     */
+    private String listDataTypes(Program program, int offset, int limit,
+                                 String category, String pattern, String kind) {
+        if (program == null) return "No program loaded";
+        DataTypeManager dtm = program.getDataTypeManager();
+
+        String catPrefix = (category != null && !category.isEmpty()) ? category : null;
+        String pat = (pattern != null && !pattern.isEmpty())
+            ? pattern.toLowerCase() : null;
+        String kindMatch = (kind != null && !kind.isEmpty() && !kind.equalsIgnoreCase("all"))
+            ? kind.toLowerCase() : null;
+
+        List<String> lines = new ArrayList<>();
+        java.util.Iterator<DataType> it = dtm.getAllDataTypes();
+        while (it.hasNext()) {
+            DataType dt = it.next();
+            if (dt == null) continue;
+            String path = dt.getPathName();
+            if (catPrefix != null && !path.startsWith(catPrefix)) continue;
+            if (pat != null && !path.toLowerCase().contains(pat)) continue;
+            String dtKind = dt.getClass().getSimpleName();
+            if (kindMatch != null && !dtKind.toLowerCase().contains(kindMatch)) continue;
+            lines.add(path + " " + dtKind + " " + dt.getLength());
+        }
+        Collections.sort(lines);
+        return paginateList(lines, offset, limit);
+    }
+
+    private String setStructMember(String structName, String offsetStr, String currentName,
+                                   String newName, String newType, String comment) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return setStructMember(program, structName, offsetStr, currentName,
+            newName, newType, comment);
+    }
+
+    /**
+     * Rename and/or retype one member of {@code structName}. The member can
+     * be identified by {@code offsetStr} (a parseable integer) OR by its
+     * current field name; supply exactly one. Any of {@code newName},
+     * {@code newType}, {@code comment} can be null/empty to leave that
+     * attribute alone.
+     *
+     * For type changes, the new type's length must be {@code &lt;=} the
+     * existing component's length — wider replacements that would clobber
+     * neighbours are rejected with a clear message.
+     */
+    private String setStructMember(Program program, String structName, String offsetStr,
+                                   String currentName, String newName, String newType,
+                                   String comment) {
+        if (program == null) return "No program loaded";
+        if (structName == null || structName.isEmpty()) return "struct parameter required";
+
+        boolean haveOffset = offsetStr != null && !offsetStr.isEmpty();
+        boolean haveName   = currentName != null && !currentName.isEmpty();
+        if (haveOffset == haveName) {
+            return "supply exactly one of offset or current_name";
+        }
+
+        DataTypeManager dtm = program.getDataTypeManager();
+        DataType dt = resolveDataTypeStrict(dtm, structName);
+        if (!(dt instanceof Structure)) {
+            return "not a struct (or not found): " + structName;
+        }
+        Structure s = (Structure) dt;
+
+        DataTypeComponent target = null;
+        if (haveOffset) {
+            int off;
+            try { off = (int) Long.decode(offsetStr).longValue(); }
+            catch (NumberFormatException e) { return "invalid offset: " + offsetStr; }
+            target = s.getComponentContaining(off);
+            if (target == null || target.getOffset() != off) {
+                return "no member at offset 0x" + Integer.toHexString(off);
+            }
+        }
+        else {
+            for (DataTypeComponent c : s.getDefinedComponents()) {
+                String f = c.getFieldName();
+                if (f != null && f.equals(currentName)) {
+                    target = c;
+                    break;
+                }
+            }
+            if (target == null) return "no member named " + currentName;
+        }
+
+        DataType replacementType = null;
+        if (newType != null && !newType.isEmpty()) {
+            replacementType = resolveDataTypeStrict(dtm, newType);
+            if (replacementType == null) return "new type not found: " + newType;
+            if (replacementType.getLength() > target.getLength()) {
+                return "new type (" + replacementType.getLength()
+                    + " bytes) wider than existing member ("
+                    + target.getLength() + " bytes); won't clobber neighbours";
+            }
+        }
+
+        int tx = program.startTransaction("MCP set_struct_member");
+        boolean ok = false;
+        String error = null;
+        try {
+            String finalName = (newName != null && !newName.isEmpty())
+                ? newName : target.getFieldName();
+            String finalComment = (comment != null) ? comment : target.getComment();
+            if (replacementType != null) {
+                // Use replaceAtOffset so the slot keeps the same offset; let
+                // Ghidra reflow any padding/undefined neighbors.
+                s.replaceAtOffset(target.getOffset(), replacementType,
+                    replacementType.getLength(), finalName, finalComment);
+            }
+            else {
+                // Type unchanged — direct field/comment edit on the component.
+                // Let any DuplicateNameException / InvalidInputException
+                // bubble up to the outer catch so the transaction is always
+                // ended (no early-return leak).
+                if (newName != null && !newName.isEmpty()) {
+                    target.setFieldName(newName);
+                }
+                if (comment != null) {
+                    target.setComment(comment);
+                }
+            }
+            ok = true;
+        }
+        catch (Exception e) {
+            error = e.getMessage();
+        }
+        finally {
+            program.endTransaction(tx, ok);
+        }
+        if (!ok) {
+            return "set failed: " + (error != null ? error : "unknown");
+        }
+        return "set member at offset 0x" + Integer.toHexString(target.getOffset())
+            + " in " + s.getPathName();
     }
 
     /**

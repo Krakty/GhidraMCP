@@ -476,6 +476,129 @@ def mark_function_thunk(address: str, target: str = None) -> str:
     return safe_post("mark_function_thunk", payload)
 
 
+# ----------------------------------------------------------------------------
+# Tier 1 PR 3: DataType endpoints
+# ----------------------------------------------------------------------------
+
+@mcp.tool()
+def parse_c_header(header: str) -> dict:
+    """
+    Parse C source into the program's DataTypeManager — same engine as the
+    GUI File -> Parse C Source.
+
+    Accepts arbitrary C: a single struct, multiple structs, typedefs, enums,
+    function prototypes. Forward-declared or referenced types not yet in the
+    DTM are created as opaque/undefined so the parse doesn't fail on
+    incomplete inputs — fill them in with follow-up parse_c_header calls.
+
+    Returns a JSON envelope: {successful, added: [<paths>], added_count,
+    error?}. Wraps the parse in a Ghidra transaction so it's undoable.
+    """
+    return safe_post("parse_c_header", {"header": header})
+
+
+@mcp.tool()
+def apply_data_type_at(address: str, type: str, clear: bool = True) -> str:
+    """
+    Apply the named DataType at <address>. The type must already exist in the
+    DTM (use parse_c_header first if needed).
+
+    With clear=True (default), existing code units in the affected byte range
+    are cleared first so the apply is idempotent — re-running on the same
+    address with the same type is a no-op. Set clear=False to refuse if the
+    address already has data.
+
+    Type names can include * for pointers (e.g. "CXWnd*") and array suffixes
+    like "[16]" when resolveDataType supports them.
+
+    Transaction-wrapped.
+    """
+    payload = {"address": address, "type": type,
+               "clear": "true" if clear else "false"}
+    return safe_post("apply_data_type_at", payload)
+
+
+@mcp.tool()
+def get_data_type(name: str, to_file: bool = False):
+    """
+    Return a JSON description of the named DataType.
+
+    For structures the response includes a "members" array with each field's
+    offset, ordinal, name, type pathname, length, and optional comment —
+    everything you need to verify or migrate a struct layout. For non-struct
+    types the response is a compact descriptor.
+
+    Pass to_file=True to spool the JSON envelope for big structures (PlayerClient,
+    CharacterZoneClient have hundreds of members); curl the URL the same way as
+    the other to_file endpoints.
+    """
+    params = {"name": name}
+    if to_file:
+        params["to_file"] = "true"
+        return safe_get_json("get_data_type", params)
+    return safe_get_json("get_data_type", params)
+
+
+@mcp.tool()
+def list_data_types(offset: int = 0, limit: int = 200,
+                    category: str = None, pattern: str = None,
+                    kind: str = None, to_file: bool = False):
+    """
+    Enumerate types in the DataTypeManager.
+
+    Args:
+        offset:   pagination offset (default 0)
+        limit:    max entries (default 200)
+        category: category-path prefix filter (e.g. "/MyHeader")
+        pattern:  case-insensitive substring match against the pathname
+        kind:     case-insensitive substring of the type-class name —
+                  "structure", "enum", "typedef", "pointer", etc.
+                  "all" or None = no filter
+        to_file:  spool the result (recommended for full-DTM dumps)
+
+    One line per type: "<path> <kind> <length>".
+    """
+    params = {"offset": offset, "limit": limit}
+    if category: params["category"] = category
+    if pattern:  params["pattern"]  = pattern
+    if kind:     params["kind"]     = kind
+    if to_file:
+        params["to_file"] = "true"
+        return safe_get_json("list_data_types", params)
+    return safe_get("list_data_types", params)
+
+
+@mcp.tool()
+def set_struct_member(struct: str, offset: str = None, current_name: str = None,
+                      new_name: str = None, new_type: str = None,
+                      comment: str = None) -> str:
+    """
+    Rename and/or retype one member of a struct.
+
+    Identify the member by exactly one of:
+      offset       — hex or decimal offset (e.g. "0x50" or "80")
+      current_name — the field's current name
+
+    Any of new_name, new_type, comment can be omitted to leave that attribute
+    alone. new_type must already exist in the DTM. Widening (new_type wider
+    than the current slot) is refused — agents should retype neighbours first
+    or use parse_c_header to redefine the whole struct.
+
+    The optional comment field is durable evidence storage — same place
+    Ghidra's GUI shows when you hover a struct field. Use it to anchor the
+    "axis-evidence" / "ASM-trace" rationale right on the field.
+
+    Transaction-wrapped.
+    """
+    payload = {"struct": struct}
+    if offset is not None:        payload["offset"] = str(offset)
+    if current_name is not None:  payload["current_name"] = current_name
+    if new_name is not None:      payload["new_name"] = new_name
+    if new_type is not None:      payload["new_type"] = new_type
+    if comment is not None:       payload["comment"] = comment
+    return safe_post("set_struct_member", payload)
+
+
 @mcp.tool()
 def program_info() -> dict:
     """
