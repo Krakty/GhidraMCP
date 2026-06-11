@@ -418,6 +418,64 @@ def delete_label(address: str = None, name: str = None) -> str:
     return safe_post("delete_label", payload)
 
 
+# ----------------------------------------------------------------------------
+# Tier 1 PR 2: function lifecycle endpoints
+# ----------------------------------------------------------------------------
+
+@mcp.tool()
+def create_function(address: str, name: str = None) -> str:
+    """
+    Create a function at <address>. Uses Ghidra's CreateFunctionCmd which
+    auto-discovers the function body via flow analysis from the entry
+    point. Pass <name> to set the function name; if omitted, Ghidra picks
+    FUN_<addr>.
+
+    Use this to promote code Ghidra's auto-analysis missed (e.g., entries
+    found via xrefs, prologue scans, or LLM-driven analysis). The change is
+    transaction-wrapped and undoable from the Ghidra GUI.
+
+    Refuses if a function already exists at the address — call
+    delete_function first to recreate.
+    """
+    payload = {"address": address}
+    if name: payload["name"] = name
+    return safe_post("create_function", payload)
+
+
+@mcp.tool()
+def delete_function(address: str) -> str:
+    """
+    Remove the function at <address> from the FunctionManager. The
+    underlying disassembly stays — only the function classification is
+    dropped. Use to retract bad auto-analysis results or stale labels from
+    prior patchdays.
+
+    Transaction-wrapped and undoable from the Ghidra GUI.
+    """
+    return safe_post("delete_function", {"address": address})
+
+
+@mcp.tool()
+def mark_function_thunk(address: str, target: str = None) -> str:
+    """
+    Mark the function at <address> as a thunk to the function at <target>.
+    Ghidra's decompiler then redirects call sites through to the target's
+    decompilation — useful for jump-table stubs that JMP into a real
+    function.
+
+    Pass target="clear" (or omit it / pass empty) to detach an existing
+    thunk relationship.
+
+    Both addresses must already be classified as functions; the call
+    fails otherwise.
+
+    Transaction-wrapped and undoable from the Ghidra GUI.
+    """
+    payload = {"address": address}
+    if target: payload["target"] = target
+    return safe_post("mark_function_thunk", payload)
+
+
 @mcp.tool()
 def program_info() -> dict:
     """

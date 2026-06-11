@@ -24,6 +24,7 @@ import ghidra.app.services.CodeViewerService;
 import ghidra.app.services.ProgramManager;
 import ghidra.app.util.PseudoDisassembler;
 import ghidra.app.cmd.function.SetVariableNameCmd;
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.listing.LocalVariableImpl;
 import ghidra.program.model.listing.ParameterImpl;
@@ -491,6 +492,24 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange,
                 deleteLabel(params.get("address"), params.get("name")));
+        });
+
+        // Tier 1 PR 2: function lifecycle.
+        server.createContext("/create_function", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange,
+                createFunction(params.get("address"), params.get("name")));
+        });
+
+        server.createContext("/delete_function", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, deleteFunction(params.get("address")));
+        });
+
+        server.createContext("/mark_function_thunk", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, markFunctionThunk(
+                params.get("address"), params.get("target")));
         });
 
         // Spool fetch endpoints: GET /dump (list), GET/DELETE /dump/{uuid}.
@@ -1908,6 +1927,159 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             return "delete failed: " + e.getMessage();
         }
         return "removed " + removed + " of " + targets.size() + " matched";
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Function lifecycle endpoints (Tier 1 PR 2)
+    // ----------------------------------------------------------------------------------
+
+    private String createFunction(String addressStr, String name) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return createFunction(program, addressStr, name);
+    }
+
+    /**
+     * Create a function at {@code addressStr} using {@link CreateFunctionCmd},
+     * which auto-discovers the function body via flow analysis. Optional
+     * {@code name} sets the function name; if null/empty Ghidra picks
+     * {@code FUN_<addr>}.
+     *
+     * Refuses to clobber an existing function at the address — callers should
+     * {@code delete_function} first if they want to recreate.
+     */
+    private String createFunction(Program program, String addressStr, String name) {
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) {
+            return "address parameter required";
+        }
+        Address addr;
+        try { addr = program.getAddressFactory().getAddress(addressStr); }
+        catch (Exception e) { return "invalid address: " + addressStr; }
+        if (addr == null) return "invalid address: " + addressStr;
+
+        Function existing = program.getFunctionManager().getFunctionAt(addr);
+        if (existing != null) {
+            return "function already exists at " + addr
+                + " (" + existing.getName() + "); delete it first to recreate";
+        }
+
+        int tx = program.startTransaction("MCP create_function");
+        try {
+            String useName = (name != null && !name.isEmpty()) ? name : null;
+            CreateFunctionCmd cmd = new CreateFunctionCmd(
+                useName, addr, null, SourceType.USER_DEFINED);
+            boolean ok = cmd.applyTo(program);
+            program.endTransaction(tx, ok);
+            if (!ok) {
+                return "create failed: "
+                    + (cmd.getStatusMsg() != null ? cmd.getStatusMsg() : "unknown");
+            }
+            Function created = program.getFunctionManager().getFunctionAt(addr);
+            String finalName = (created != null) ? created.getName() : "?";
+            return "created function " + finalName + " at " + addr;
+        }
+        catch (Exception e) {
+            program.endTransaction(tx, false);
+            return "create failed: " + e.getMessage();
+        }
+    }
+
+    private String deleteFunction(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return deleteFunction(program, addressStr);
+    }
+
+    /**
+     * Remove the function at {@code addressStr} from the FunctionManager. The
+     * underlying code/disassembly stays — only the function classification is
+     * dropped. Wrap in a transaction so it's undoable.
+     */
+    private String deleteFunction(Program program, String addressStr) {
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) {
+            return "address parameter required";
+        }
+        Address addr;
+        try { addr = program.getAddressFactory().getAddress(addressStr); }
+        catch (Exception e) { return "invalid address: " + addressStr; }
+        if (addr == null) return "invalid address: " + addressStr;
+
+        Function fn = program.getFunctionManager().getFunctionAt(addr);
+        if (fn == null) return "no function at " + addr;
+        String oldName = fn.getName();
+
+        int tx = program.startTransaction("MCP delete_function");
+        boolean ok;
+        try {
+            ok = program.getFunctionManager().removeFunction(addr);
+            program.endTransaction(tx, ok);
+        }
+        catch (Exception e) {
+            program.endTransaction(tx, false);
+            return "delete failed: " + e.getMessage();
+        }
+        return ok
+            ? "deleted function " + oldName + " at " + addr
+            : "delete failed at " + addr;
+    }
+
+    private String markFunctionThunk(String addressStr, String targetAddrStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        return markFunctionThunk(program, addressStr, targetAddrStr);
+    }
+
+    /**
+     * Mark the function at {@code addressStr} as a thunk to the function at
+     * {@code targetAddrStr}. Pass {@code targetAddrStr == "clear"} (or empty)
+     * to clear the thunk flag and detach.
+     *
+     * Ghidra's decompiler uses thunk relationships to redirect call sites to
+     * the thunked function — useful for jump-table stubs that just JMP into
+     * a real function.
+     */
+    private String markFunctionThunk(Program program, String addressStr, String targetAddrStr) {
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) {
+            return "address parameter required";
+        }
+        Address addr;
+        try { addr = program.getAddressFactory().getAddress(addressStr); }
+        catch (Exception e) { return "invalid address: " + addressStr; }
+        if (addr == null) return "invalid address: " + addressStr;
+
+        Function fn = program.getFunctionManager().getFunctionAt(addr);
+        if (fn == null) return "no function at " + addr;
+
+        boolean clear = targetAddrStr == null
+            || targetAddrStr.isEmpty()
+            || targetAddrStr.equalsIgnoreCase("clear");
+
+        Function target = null;
+        Address targetAddr = null;
+        if (!clear) {
+            try { targetAddr = program.getAddressFactory().getAddress(targetAddrStr); }
+            catch (Exception e) { return "invalid target address: " + targetAddrStr; }
+            if (targetAddr == null) return "invalid target address: " + targetAddrStr;
+            target = program.getFunctionManager().getFunctionAt(targetAddr);
+            if (target == null) return "no function at target " + targetAddr;
+        }
+
+        int tx = program.startTransaction("MCP mark_function_thunk");
+        try {
+            fn.setThunkedFunction(target);
+            program.endTransaction(tx, true);
+        }
+        catch (Exception e) {
+            program.endTransaction(tx, false);
+            return "set thunk failed: " + e.getMessage();
+        }
+        return clear
+            ? "cleared thunk at " + addr
+            : "marked " + addr + " (" + fn.getName() + ") as thunk -> "
+                + targetAddr + " (" + target.getName() + ")";
     }
 
     /**

@@ -127,6 +127,9 @@ All endpoints are served on every bound port. They operate on
 | `/list_symbols`                | GET    | Whole SymbolTable; filter by `type`/`source` |
 | `/get_symbol_at`               | GET    | All symbols at an address (primary + aliases) |
 | `/delete_label`                | POST   | Remove a label by address and/or name |
+| `/create_function`             | POST   | Promote bytes to a function at an address |
+| `/delete_function`             | POST   | Retract a function classification |
+| `/mark_function_thunk`         | POST   | Mark function as thunk to another (or clear) |
 | `/dump/{uuid}`                 | GET    | Stream a spooled large response      |
 | `/dump/{uuid}`                 | DELETE | Explicit cleanup of a spooled file   |
 | `/dump`                        | GET    | List active spooled files            |
