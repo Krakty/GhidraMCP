@@ -50,6 +50,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 import javax.swing.SwingUtilities;
+import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
@@ -81,6 +82,15 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
 
     private HttpServer server;
     private int boundPort = -1;
+
+    /**
+     * Spool manager for the to_file=true large-response pattern. Lazy-initialised
+     * on first spool/dump request from the program currently bound to this tool.
+     * Reset to null on program change; next request rebuilds it against the new
+     * project dir.
+     */
+    private DumpManager dumpManager;
+    private Program dumpManagerProgram;
 
     public GhidraMCPMultiProgramPlugin(PluginTool tool) {
         super(tool);
@@ -319,19 +329,25 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         });
 
         server.createContext("/list_functions", exchange -> {
-            sendResponse(exchange, listFunctions());
+            Map<String, String> qparams = parseQueryParams(exchange);
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            respondMaybeSpool(exchange, toFile, "funcs", listFunctions());
         });
 
         server.createContext("/decompile_function", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
             String address = qparams.get("address");
-            sendResponse(exchange, decompileFunctionByAddress(address));
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            respondMaybeSpool(exchange, toFile, "decomp",
+                decompileFunctionByAddress(address));
         });
 
         server.createContext("/disassemble_function", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
             String address = qparams.get("address");
-            sendResponse(exchange, disassembleFunction(address));
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            respondMaybeSpool(exchange, toFile, "disasm",
+                disassembleFunction(address));
         });
 
         server.createContext("/set_decompiler_comment", exchange -> {
@@ -449,8 +465,16 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
-            sendResponse(exchange, listDefinedStrings(offset, limit, filter));
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            respondMaybeSpool(exchange, toFile, "strs",
+                listDefinedStrings(offset, limit, filter));
         });
+
+        // Spool fetch endpoints: GET /dump (list), GET/DELETE /dump/{uuid}.
+        // The Java HttpServer uses longest-prefix matching; "/dump/" catches
+        // ID requests, "/dump" catches the list path.
+        server.createContext("/dump/", exchange -> handleDumpById(exchange));
+        server.createContext("/dump",  exchange -> handleDumpList(exchange));
 
         server.setExecutor(null);
         new Thread(() -> {
@@ -1910,6 +1934,244 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         exchange.sendResponseHeaders(200, bytes.length);
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(bytes);
+        }
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Spool-to-disk plumbing (Tier 0)
+    // See PR_SCOPE_TIER0.md for the design.
+    // ----------------------------------------------------------------------------------
+
+    private void sendJson(HttpExchange exchange, String json) throws IOException {
+        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    private void sendStatus(HttpExchange exchange, int code, String body) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+        exchange.sendResponseHeaders(code, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    /**
+     * Lazy DumpManager — built against the program currently bound to this
+     * tool. Returns null if no program is loaded (caller should surface a
+     * JSON error to the agent).
+     */
+    private synchronized DumpManager getOrCreateDumpManager() {
+        Program p = getCurrentProgram();
+        if (p == null) return null;
+        if (dumpManager == null || dumpManagerProgram != p) {
+            try {
+                dumpManager = new DumpManager(p);
+                dumpManagerProgram = p;
+            }
+            catch (IOException e) {
+                Msg.error(this, "Failed to initialise DumpManager for "
+                    + p.getName() + ": " + e.getMessage());
+                dumpManager = null;
+                dumpManagerProgram = null;
+            }
+        }
+        return dumpManager;
+    }
+
+    /**
+     * Spool {@code body} and respond with a small JSON envelope containing the
+     * fetch URL the agent should curl. If {@code toFile} is false, behave as
+     * the legacy text response.
+     */
+    private void respondMaybeSpool(HttpExchange exchange, boolean toFile,
+                                   String endpointTag, String body) throws IOException {
+        if (!toFile) {
+            sendResponse(exchange, body);
+            return;
+        }
+        DumpManager dm = getOrCreateDumpManager();
+        if (dm == null) {
+            sendJson(exchange,
+                "{\"error\":\"no program loaded; cannot spool\"}");
+            return;
+        }
+        try {
+            String uuid = dm.spool(endpointTag, body);
+            long lines = DumpManager.countLines(body);
+            long bytes = body.getBytes(StandardCharsets.UTF_8).length;
+            sendJson(exchange, buildSpoolEnvelope(exchange, uuid, endpointTag, bytes, lines));
+        }
+        catch (IOException e) {
+            Msg.error(this, "Spool write failed: " + e.getMessage());
+            sendJson(exchange, "{\"error\":\"spool write failed: "
+                + jsonEscape(e.getMessage()) + "\"}");
+        }
+    }
+
+    /**
+     * Build the JSON envelope the agent receives after a successful spool.
+     * URL host comes from the request's {@code Host:} header so the agent
+     * gets a URL it can actually reach, whatever interface the plugin bound on.
+     */
+    private String buildSpoolEnvelope(HttpExchange exchange, String uuid, String endpointTag,
+                                      long bytes, long lines) {
+        String host = exchange.getRequestHeaders().getFirst("Host");
+        if (host == null || host.isEmpty()) {
+            host = "localhost:" + boundPort;
+        }
+        return "{"
+            + "\"url\":\"http://" + host + "/dump/" + uuid + "\","
+            + "\"uuid\":\"" + uuid + "\","
+            + "\"endpoint\":\"" + endpointTag + "\","
+            + "\"bytes\":" + bytes + ","
+            + "\"lines\":" + lines + ","
+            + "\"ttl_seconds\":" + (DumpManager.TTL_MS / 1000L)
+            + "}";
+    }
+
+    private static String jsonEscape(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"':  sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                    else          sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Handle {@code GET /dump/{uuid}} (stream) or {@code DELETE /dump/{uuid}} (nuke). */
+    private void handleDumpById(HttpExchange exchange) throws IOException {
+        String path = exchange.getRequestURI().getPath();
+        String uuid = path.substring("/dump/".length());
+        // Strip any trailing slash or query that snuck past the context match.
+        int slash = uuid.indexOf('/');
+        if (slash >= 0) uuid = uuid.substring(0, slash);
+
+        DumpManager dm = getOrCreateDumpManager();
+        if (dm == null) {
+            sendStatus(exchange, 404, "no program loaded");
+            return;
+        }
+
+        if ("DELETE".equals(exchange.getRequestMethod())) {
+            boolean ok = dm.delete(uuid);
+            sendStatus(exchange, ok ? 200 : 404, ok ? "deleted" : "not found");
+            return;
+        }
+
+        File spool = dm.resolve(uuid);
+        if (spool == null) {
+            sendStatus(exchange, 404, "not found");
+            return;
+        }
+
+        Map<String, String> qparams = parseQueryParams(exchange);
+        boolean deleteAfter = "true".equals(qparams.get("delete_after"));
+
+        String rangeHeader = exchange.getRequestHeaders().getFirst("Range");
+        if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+            long[] bounds = parseRange(rangeHeader, spool.length());
+            if (bounds == null) {
+                sendStatus(exchange, 416, "range not satisfiable");
+                return;
+            }
+            long len = bounds[1] - bounds[0] + 1;
+            exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+            exchange.getResponseHeaders().set("Content-Range",
+                "bytes " + bounds[0] + "-" + bounds[1] + "/" + spool.length());
+            exchange.sendResponseHeaders(206, len);
+            try (OutputStream os = exchange.getResponseBody()) {
+                DumpManager.streamRange(spool, bounds[0], bounds[1], os);
+            }
+        }
+        else {
+            exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+            exchange.sendResponseHeaders(200, spool.length());
+            try (OutputStream os = exchange.getResponseBody()) {
+                DumpManager.streamTo(spool, os);
+            }
+        }
+
+        if (deleteAfter) {
+            dm.delete(uuid);
+        }
+    }
+
+    /** Parse a single-range {@code Range: bytes=N-M} header. Returns null if unparseable. */
+    private static long[] parseRange(String header, long fileLength) {
+        try {
+            String spec = header.substring("bytes=".length()).trim();
+            // Reject multi-range (commas) — overkill for our use case.
+            if (spec.indexOf(',') >= 0) return null;
+            int dash = spec.indexOf('-');
+            if (dash < 0) return null;
+            String fromStr = spec.substring(0, dash).trim();
+            String toStr = spec.substring(dash + 1).trim();
+            long from, to;
+            if (fromStr.isEmpty()) {
+                // Suffix range: bytes=-N (last N bytes)
+                long n = Long.parseLong(toStr);
+                if (n <= 0) return null;
+                from = Math.max(0, fileLength - n);
+                to = fileLength - 1;
+            }
+            else {
+                from = Long.parseLong(fromStr);
+                to = toStr.isEmpty() ? fileLength - 1 : Long.parseLong(toStr);
+            }
+            if (from < 0 || to >= fileLength || from > to) return null;
+            return new long[] { from, to };
+        }
+        catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Handle {@code GET /dump} (no uuid) — list active spools as a JSON array.
+     */
+    private void handleDumpList(HttpExchange exchange) throws IOException {
+        DumpManager dm = getOrCreateDumpManager();
+        if (dm == null) {
+            sendJson(exchange, "[]");
+            return;
+        }
+        try {
+            List<Map<String, Object>> entries = dm.list();
+            StringBuilder sb = new StringBuilder();
+            sb.append('[');
+            boolean first = true;
+            for (Map<String, Object> e : entries) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append('{');
+                sb.append("\"uuid\":\"").append(e.get("uuid")).append("\",");
+                sb.append("\"endpoint\":\"").append(e.get("endpoint")).append("\",");
+                sb.append("\"bytes\":").append(e.get("bytes")).append(',');
+                sb.append("\"lines\":").append(e.get("lines")).append(',');
+                sb.append("\"age_seconds\":").append(e.get("age_seconds"));
+                sb.append('}');
+            }
+            sb.append(']');
+            sendJson(exchange, sb.toString());
+        }
+        catch (IOException e) {
+            sendJson(exchange, "{\"error\":\"list failed: "
+                + jsonEscape(e.getMessage()) + "\"}");
         }
     }
 

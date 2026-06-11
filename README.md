@@ -124,6 +124,49 @@ All endpoints are served on every bound port. They operate on
 | `/xrefs_from`                  | GET    | References out from an address       |
 | `/function_xrefs`              | GET    | References involving a function      |
 | `/strings`                     | GET    | Defined strings (`filter` supported) |
+| `/dump/{uuid}`                 | GET    | Stream a spooled large response      |
+| `/dump/{uuid}`                 | DELETE | Explicit cleanup of a spooled file   |
+| `/dump`                        | GET    | List active spooled files            |
+
+### Large-response spool pattern (`to_file=true`)
+
+Four endpoints — `/decompile_function`, `/disassemble_function`,
+`/list_functions`, `/strings` — accept a `to_file=true` query parameter. When
+set, the response body is written to a UUID-named file under the program's
+project directory (`<projectDir>/.mcp_dumps/`) and the JSON response contains
+only a small envelope:
+
+```json
+GET /disassemble_function?address=0x...&to_file=true
+{
+  "url": "http://host:8090/dump/disasm-3f2c8b9e",
+  "uuid": "disasm-3f2c8b9e",
+  "endpoint": "disassemble_function",
+  "bytes": 47823412,
+  "lines": 412953,
+  "ttl_seconds": 3600
+}
+```
+
+Why: the MCP stdio transport drops the bridge when a single response is
+multi-MB. With `to_file=true`, the MCP message stays tiny — the agent fetches
+the actual body over plain HTTP via `curl`:
+
+```sh
+url=$(... call with to_file=True ... | jq -r .url)
+curl -s "$url" | grep -nE '\+ 0x254\b'          # stream-search, no local file
+curl -s -o /tmp/dump.txt "$url"                  # local copy for repeated grep
+curl -s -r 0-1023 "$url"                         # peek at first 1KB
+curl -X DELETE "$url"                            # explicit nuke (maildir-style)
+curl -s "$url?delete_after=true" | grep ...       # fetch + nuke in one call
+```
+
+Files auto-expire after 3600 seconds. The sweep runs opportunistically on
+every spool/fetch/list operation; no background thread is involved.
+
+Safety: the `/dump/{uuid}` endpoint validates the UUID against a fixed
+regex and canonical-path-checks the resolved file is under the spool dir.
+The caller never controls a filesystem path.
 
 ### `/renameData` (v0.2.1 change)
 

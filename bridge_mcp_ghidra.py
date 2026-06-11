@@ -48,6 +48,30 @@ def safe_get(endpoint: str, params: dict = None) -> list:
     except Exception as e:
         return [f"Request failed: {str(e)}"]
 
+def safe_get_json(endpoint: str, params: dict = None) -> dict:
+    """
+    GET <endpoint> and parse the response as JSON. Used by spool-mode
+    (to_file=True) responses, which return a small envelope describing where
+    the agent can curl the actual body.
+
+    On HTTP or decode error, returns {"error": "..."} so the caller (an MCP
+    tool) can surface the failure as a normal tool result rather than raising.
+    """
+    if params is None:
+        params = {}
+    url = urljoin(ghidra_server_url, endpoint)
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.encoding = "utf-8"
+        if not response.ok:
+            return {"error": f"HTTP {response.status_code}: {response.text.strip()}"}
+        return response.json()
+    except ValueError as e:
+        return {"error": f"JSON decode failed: {e}"}
+    except Exception as e:
+        return {"error": f"Request failed: {e}"}
+
+
 def safe_post(endpoint: str, data: dict | str) -> str:
     try:
         url = urljoin(ghidra_server_url, endpoint)
@@ -175,24 +199,47 @@ def get_current_function() -> str:
     return "\n".join(safe_get("get_current_function"))
 
 @mcp.tool()
-def list_functions() -> list:
+def list_functions(to_file: bool = False):
     """
     List all functions in the database.
+
+    When to_file=True, the result is spooled to a file on the plugin host and
+    a small JSON envelope with a fetch URL is returned. Useful for large
+    binaries where the full function list would otherwise overflow the MCP
+    transport. Fetch the URL with curl in a Bash tool call.
     """
+    if to_file:
+        return safe_get_json("list_functions", {"to_file": "true"})
     return safe_get("list_functions")
 
 @mcp.tool()
-def decompile_function_by_address(address: str) -> str:
+def decompile_function_by_address(address: str, to_file: bool = False):
     """
     Decompile a function at the given address.
+
+    When to_file=True, the decompiled C is spooled to a file on the plugin
+    host and a small JSON envelope with a fetch URL is returned. Useful for
+    very large functions where the MCP transport would otherwise drop. Fetch
+    the URL with curl in a Bash tool call.
     """
+    if to_file:
+        return safe_get_json("decompile_function",
+                             {"address": address, "to_file": "true"})
     return "\n".join(safe_get("decompile_function", {"address": address}))
 
 @mcp.tool()
-def disassemble_function(address: str) -> list:
+def disassemble_function(address: str, to_file: bool = False):
     """
     Get assembly code (address: instruction; comment) for a function.
+
+    When to_file=True, the disassembly is spooled to a file on the plugin
+    host and a small JSON envelope with a fetch URL is returned. Useful for
+    very large functions where the MCP transport would otherwise drop. Fetch
+    the URL with curl in a Bash tool call.
     """
+    if to_file:
+        return safe_get_json("disassemble_function",
+                             {"address": address, "to_file": "true"})
     return safe_get("disassemble_function", {"address": address})
 
 @mcp.tool()
@@ -276,21 +323,29 @@ def get_function_xrefs(name: str, offset: int = 0, limit: int = 100) -> list:
     return safe_get("function_xrefs", {"name": name, "offset": offset, "limit": limit})
 
 @mcp.tool()
-def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list:
+def list_strings(offset: int = 0, limit: int = 2000, filter: str = None,
+                 to_file: bool = False):
     """
     List all defined strings in the program with their addresses.
-    
+
     Args:
         offset: Pagination offset (default: 0)
         limit: Maximum number of strings to return (default: 2000)
         filter: Optional filter to match within string content
-        
+        to_file: When True, spool the result to a file on the plugin host
+                 and return a small JSON envelope with a fetch URL. Useful
+                 for large string tables. Fetch with curl in a Bash call.
+
     Returns:
-        List of strings with their addresses
+        Without to_file: list of strings with their addresses.
+        With to_file:    dict envelope {url, uuid, bytes, lines, ttl_seconds}.
     """
     params = {"offset": offset, "limit": limit}
     if filter:
         params["filter"] = filter
+    if to_file:
+        params["to_file"] = "true"
+        return safe_get_json("strings", params)
     return safe_get("strings", params)
 
 @mcp.tool()
