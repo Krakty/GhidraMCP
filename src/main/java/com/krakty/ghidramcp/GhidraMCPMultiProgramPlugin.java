@@ -25,6 +25,16 @@ import ghidra.app.services.ProgramManager;
 import ghidra.app.util.PseudoDisassembler;
 import ghidra.app.cmd.function.SetVariableNameCmd;
 import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.script.GhidraScript;
+import ghidra.app.script.GhidraScriptProvider;
+import ghidra.app.script.GhidraScriptUtil;
+import ghidra.app.script.GhidraState;
+import ghidra.app.script.ScriptInfo;
+import generic.jar.ResourceFile;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.io.FileWriter;
+import java.io.BufferedWriter;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.listing.LocalVariableImpl;
 import ghidra.program.model.listing.ParameterImpl;
@@ -630,6 +640,36 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             int depth = parseIntOrDefault(qparams.get("depth"), 2);
             sendJson(exchange, getCallgraph(
                 qparams.get("address"), depth, qparams.get("direction")));
+        });
+
+        // PR_SCOPE_RUN_SCRIPT: script execution + listing.
+        server.createContext("/list_scripts", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"),  500);
+            boolean toFile = "true".equals(qparams.get("to_file"));
+            String body = listScripts(offset, limit,
+                qparams.get("category"), qparams.get("pattern"), qparams.get("language"));
+            if (toFile) {
+                respondMaybeSpool(exchange, true, "scripts", body);
+            } else {
+                sendJson(exchange, body);
+            }
+        });
+
+        server.createContext("/run_script", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String scriptName = params.get("script_name");
+            String scriptBody = params.get("script_body");
+            String argsRaw = params.get("args");
+            String[] args = null;
+            if (argsRaw != null && !argsRaw.isEmpty()) {
+                args = argsRaw.split("\n");
+            }
+            boolean toFile = "true".equals(params.get("to_file"));
+            String txName = params.get("transaction_name");
+            sendJson(exchange,
+                runScript(exchange, scriptName, scriptBody, args, toFile, txName));
         });
 
         // Spool fetch endpoints: GET /dump (list), GET/DELETE /dump/{uuid}.
@@ -3230,6 +3270,348 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             sb.append('}');
         }
         sb.append("]}");
+        return sb.toString();
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Script execution endpoints (PR_SCOPE_RUN_SCRIPT.md)
+    //
+    // /list_scripts:  walk Ghidra's known script source directories, return
+    //                 every script with metadata (name, path, language, category,
+    //                 description). Filterable by category/pattern/language.
+    // /run_script:    execute a script by name OR a posted-inline Python body.
+    //                 Captures stdout/stderr/exit_code/runtime. Inherits the
+    //                 Tier 0 to_file=true contract so giant stdout doesn't
+    //                 jam the bridge.
+    // ----------------------------------------------------------------------------------
+
+    /** Dir name under the project for staging inline script bodies. */
+    private static final String INLINE_SCRIPTS_DIRNAME = ".mcp_inline_scripts";
+
+    /** Path-safety regex — inline filenames are only ever {@code inline-mcp-XXXXXXXX.py}. */
+    private static final java.util.regex.Pattern INLINE_SCRIPT_NAME =
+        java.util.regex.Pattern.compile("^inline-mcp-[0-9a-f]{8}\\.py$");
+
+    /** Hard cap on captured stdout before forcing to_file. Protects MCP transport. */
+    private static final int INLINE_STDOUT_MAX = 50 * 1024 * 1024;  // 50 MB
+
+    private String listScripts(int offset, int limit, String categoryFilter,
+                               String patternFilter, String languageFilter) {
+        Program program = getCurrentProgram();
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        return listScripts(program, offset, limit, categoryFilter, patternFilter, languageFilter);
+    }
+
+    /**
+     * Walk every known Ghidra script directory and return one JSON object per
+     * script. Filters are substring matches; null/empty means no filter.
+     */
+    private String listScripts(Program program, int offset, int limit,
+                               String categoryFilter, String patternFilter,
+                               String languageFilter) {
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+
+        String catWant  = (categoryFilter != null && !categoryFilter.isEmpty())
+            ? categoryFilter.toLowerCase() : null;
+        String patWant  = (patternFilter != null && !patternFilter.isEmpty())
+            ? patternFilter.toLowerCase() : null;
+        String langWant = (languageFilter != null && !languageFilter.isEmpty()
+            && !languageFilter.equalsIgnoreCase("all"))
+            ? languageFilter.toLowerCase() : null;
+
+        List<String> entries = new ArrayList<>();
+        for (ResourceFile dir : GhidraScriptUtil.getScriptSourceDirectories()) {
+            if (dir == null || !dir.isDirectory()) continue;
+            ResourceFile[] kids = dir.listFiles();
+            if (kids == null) continue;
+            for (ResourceFile rf : kids) {
+                if (rf == null || rf.isDirectory()) continue;
+                String name = rf.getName();
+                if (name == null) continue;
+                // Only files Ghidra can run.
+                if (GhidraScriptUtil.getProvider(rf) == null) continue;
+                ScriptInfo info;
+                try { info = GhidraScriptUtil.newScriptInfo(rf); }
+                catch (Exception e) { continue; }
+                String[] cats = info.getCategory();
+                String catStr = (cats != null && cats.length > 0)
+                    ? String.join("/", cats) : "";
+                String lang = info.getRuntimeEnvironmentName();
+                String desc = info.getDescription();
+                String path = rf.getAbsolutePath();
+
+                if (catWant != null && !catStr.toLowerCase().contains(catWant)) continue;
+                if (patWant != null && !name.toLowerCase().contains(patWant)
+                    && !path.toLowerCase().contains(patWant)) continue;
+                if (langWant != null
+                    && (lang == null || !lang.toLowerCase().contains(langWant))) continue;
+
+                StringBuilder sb = new StringBuilder();
+                sb.append('{');
+                sb.append("\"name\":\"").append(jsonEscape(name)).append("\",");
+                sb.append("\"path\":\"").append(jsonEscape(path)).append("\",");
+                sb.append("\"language\":\"").append(jsonEscape(lang != null ? lang : "")).append("\",");
+                sb.append("\"category\":\"").append(jsonEscape(catStr)).append("\",");
+                sb.append("\"description\":\"").append(jsonEscape(desc != null ? desc : "")).append('"');
+                sb.append('}');
+                entries.add(sb.toString());
+            }
+        }
+        Collections.sort(entries);
+
+        // Pagination over the JSON-object array.
+        int total = entries.size();
+        int from = Math.max(0, offset);
+        int to = (limit > 0) ? Math.min(total, from + limit) : total;
+        StringBuilder out = new StringBuilder();
+        out.append("{\"total\":").append(total).append(',');
+        out.append("\"offset\":").append(from).append(',');
+        out.append("\"limit\":").append(to - from).append(',');
+        out.append("\"scripts\":[");
+        for (int i = from; i < to; i++) {
+            if (i > from) out.append(',');
+            out.append(entries.get(i));
+        }
+        out.append("]}");
+        return out.toString();
+    }
+
+    /**
+     * Stage an inline Python body as a temp file under
+     * {@code <projectDir>/.mcp_inline_scripts/}. Filename is
+     * {@code inline-mcp-<8hex>.py} for path-safety. Caller is responsible for
+     * deleting in a finally block.
+     */
+    private File stageInlineScript(Program program, String body) throws IOException {
+        File projectDir = program.getDomainFile().getProjectLocator().getProjectDir();
+        File stagingDir = new File(projectDir, INLINE_SCRIPTS_DIRNAME);
+        if (!stagingDir.exists() && !stagingDir.mkdirs()) {
+            throw new IOException("could not create staging dir: " + stagingDir);
+        }
+        // Opportunistic sweep of stale orphans (> 1h).
+        long now = System.currentTimeMillis();
+        File[] kids = stagingDir.listFiles();
+        if (kids != null) {
+            for (File k : kids) {
+                if (INLINE_SCRIPT_NAME.matcher(k.getName()).matches()
+                    && now - k.lastModified() > 3600_000L) {
+                    k.delete();
+                }
+            }
+        }
+        String uuid = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        File staged = new File(stagingDir, "inline-mcp-" + uuid + ".py");
+        try (BufferedWriter w = new BufferedWriter(new FileWriter(staged))) {
+            w.write(body);
+        }
+        // Make sure GhidraScriptUtil can find it: it relies on the dir being
+        // in the script-source path. We add it on first use; idempotent.
+        boolean known = false;
+        for (ResourceFile d : GhidraScriptUtil.getScriptSourceDirectories()) {
+            if (d != null && d.equals(new ResourceFile(stagingDir))) {
+                known = true; break;
+            }
+        }
+        if (!known) {
+            try {
+                GhidraScriptUtil.getBundleHost().add(new ResourceFile(stagingDir), true, false);
+            }
+            catch (Exception e) {
+                Msg.warn(this, "could not register staging dir: " + e.getMessage());
+            }
+        }
+        return staged;
+    }
+
+    private String runScript(HttpExchange exchange, String scriptName, String scriptBody,
+                             String[] args, boolean toFile, String txName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        return runScript(exchange, program, scriptName, scriptBody, args, toFile, txName);
+    }
+
+    /**
+     * Run a Ghidra script — by name (installed under any script source dir)
+     * or by raw {@code scriptBody} (staged as inline Python under
+     * {@code <projectDir>/.mcp_inline_scripts/}, deleted in finally). Captures
+     * stdout + stderr; reports exit_code (0 on success, non-zero on script
+     * exception) and runtime_ms.
+     *
+     * Transaction-wrapped: script mutations are undoable from the Ghidra GUI.
+     */
+    private String runScript(HttpExchange exchange, Program program, String scriptName,
+                             String scriptBody, String[] args, boolean toFile, String txName) {
+        if (program == null) return "{\"error\":\"No program loaded\"}";
+        boolean haveName = (scriptName != null && !scriptName.isEmpty());
+        boolean haveBody = (scriptBody != null && !scriptBody.isEmpty());
+        if (haveName == haveBody) {
+            return "{\"error\":\"supply exactly one of script_name or script_body\"}";
+        }
+
+        File stagedFile = null;
+        boolean cleanupStaged = false;
+        ResourceFile srcFile;
+        try {
+            if (haveBody) {
+                try { stagedFile = stageInlineScript(program, scriptBody); }
+                catch (IOException e) {
+                    return "{\"error\":\"inline staging failed: "
+                        + jsonEscape(e.getMessage()) + "\"}";
+                }
+                cleanupStaged = true;
+                srcFile = new ResourceFile(stagedFile);
+                scriptName = stagedFile.getName();
+            }
+            else {
+                srcFile = GhidraScriptUtil.findScriptByName(scriptName);
+                if (srcFile == null) {
+                    return "{\"error\":\"script not found: "
+                        + jsonEscape(scriptName) + "\"}";
+                }
+            }
+        }
+        catch (Exception e) {
+            if (cleanupStaged && stagedFile != null) stagedFile.delete();
+            return "{\"error\":\"resolution failed: "
+                + jsonEscape(e.getMessage()) + "\"}";
+        }
+
+        GhidraScriptProvider provider = GhidraScriptUtil.getProvider(srcFile);
+        if (provider == null) {
+            if (cleanupStaged && stagedFile != null) stagedFile.delete();
+            return "{\"error\":\"no script provider for: "
+                + jsonEscape(scriptName) + "\"}";
+        }
+
+        StringWriter stdoutBuf = new StringWriter();
+        StringWriter stderrBuf = new StringWriter();
+        PrintWriter outPw = new PrintWriter(stdoutBuf);
+        PrintWriter errPw = new PrintWriter(stderrBuf);
+        int exitCode = 0;
+        long t0 = System.currentTimeMillis();
+        String exceptionTrace = null;
+
+        try {
+            GhidraScript script;
+            try {
+                script = provider.getScriptInstance(srcFile, errPw);
+            }
+            catch (Exception e) {
+                errPw.println("LOAD_EXCEPTION: " + e);
+                e.printStackTrace(errPw);
+                outPw.flush(); errPw.flush();
+                if (cleanupStaged && stagedFile != null) stagedFile.delete();
+                return scriptResponseEnvelope(exchange, scriptName, 2,
+                    System.currentTimeMillis() - t0,
+                    stdoutBuf.toString(), stderrBuf.toString(), toFile);
+            }
+            if (script == null) {
+                errPw.println("LOAD: provider returned null script instance");
+                outPw.flush(); errPw.flush();
+                if (cleanupStaged && stagedFile != null) stagedFile.delete();
+                return scriptResponseEnvelope(exchange, scriptName, 2,
+                    System.currentTimeMillis() - t0,
+                    stdoutBuf.toString(), stderrBuf.toString(), toFile);
+            }
+            if (args != null) script.setScriptArgs(args);
+
+            GhidraState state = new GhidraState(tool, tool.getProject(),
+                program, null, null, null);
+            String txLabel = (txName != null && !txName.isEmpty())
+                ? txName : "MCP run_script " + scriptName;
+            int tx = program.startTransaction(txLabel);
+            try {
+                script.execute(state, new ConsoleTaskMonitor(), outPw);
+                program.endTransaction(tx, true);
+            }
+            catch (Exception e) {
+                program.endTransaction(tx, false);
+                errPw.println("EXCEPTION: " + e);
+                e.printStackTrace(errPw);
+                exitCode = 1;
+            }
+        }
+        catch (Exception e) {
+            errPw.println("FATAL: " + e);
+            e.printStackTrace(errPw);
+            exitCode = 2;
+        }
+        finally {
+            outPw.flush(); errPw.flush();
+            if (cleanupStaged && stagedFile != null) {
+                stagedFile.delete();
+            }
+        }
+
+        long runtimeMs = System.currentTimeMillis() - t0;
+        return scriptResponseEnvelope(exchange, scriptName, exitCode, runtimeMs,
+            stdoutBuf.toString(), stderrBuf.toString(), toFile);
+    }
+
+    /**
+     * Build the JSON envelope for a script response. If {@code toFile} is true
+     * (or stdout exceeds {@link #INLINE_STDOUT_MAX} regardless of request),
+     * stdout spools to disk via the existing Tier 0 DumpManager and the
+     * response contains the fetch URL instead of the body.
+     */
+    private String scriptResponseEnvelope(HttpExchange exchange, String scriptName,
+                                          int exitCode, long runtimeMs,
+                                          String stdout, String stderr, boolean toFile) {
+        boolean forceSpool = stdout.length() > INLINE_STDOUT_MAX;
+        if (toFile || forceSpool) {
+            DumpManager dm = getOrCreateDumpManager();
+            if (dm == null) {
+                // No program -> no dump manager. Fall back to inline; honesty over politeness.
+                return scriptResponseInline(scriptName, exitCode, runtimeMs, stdout, stderr,
+                    forceSpool ? "stdout was force-spooled but DumpManager unavailable" : null);
+            }
+            try {
+                String uuid = dm.spool("script", stdout);
+                long bytes = stdout.getBytes(StandardCharsets.UTF_8).length;
+                long lines = DumpManager.countLines(stdout);
+                StringBuilder sb = new StringBuilder();
+                sb.append('{');
+                sb.append("\"script\":\"").append(jsonEscape(scriptName)).append("\",");
+                sb.append("\"exit_code\":").append(exitCode).append(',');
+                sb.append("\"runtime_ms\":").append(runtimeMs).append(',');
+                String host = (exchange != null)
+                    ? exchange.getRequestHeaders().getFirst("Host") : null;
+                if (host == null || host.isEmpty()) host = "localhost:" + boundPort;
+                sb.append("\"stdout_url\":\"http://").append(host)
+                  .append("/dump/").append(uuid).append("\",");
+                sb.append("\"stdout_uuid\":\"").append(uuid).append("\",");
+                sb.append("\"stdout_bytes\":").append(bytes).append(',');
+                sb.append("\"stdout_lines\":").append(lines).append(',');
+                sb.append("\"stderr\":\"").append(jsonEscape(stderr)).append('"');
+                if (forceSpool && !toFile) {
+                    sb.append(",\"note\":\"stdout exceeded ")
+                      .append(INLINE_STDOUT_MAX)
+                      .append(" bytes; force-spooled\"");
+                }
+                sb.append('}');
+                return sb.toString();
+            }
+            catch (Exception e) {
+                Msg.error(this, "script stdout spool failed: " + e.getMessage());
+                return scriptResponseInline(scriptName, exitCode, runtimeMs, stdout, stderr,
+                    "spool failed: " + e.getMessage());
+            }
+        }
+        return scriptResponseInline(scriptName, exitCode, runtimeMs, stdout, stderr, null);
+    }
+
+    private String scriptResponseInline(String scriptName, int exitCode,
+                                        long runtimeMs, String stdout,
+                                        String stderr, String note) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        sb.append("\"script\":\"").append(jsonEscape(scriptName)).append("\",");
+        sb.append("\"exit_code\":").append(exitCode).append(',');
+        sb.append("\"runtime_ms\":").append(runtimeMs).append(',');
+        sb.append("\"stdout\":\"").append(jsonEscape(stdout)).append("\",");
+        sb.append("\"stderr\":\"").append(jsonEscape(stderr)).append('"');
+        if (note != null) sb.append(",\"note\":\"").append(jsonEscape(note)).append('"');
+        sb.append('}');
         return sb.toString();
     }
 

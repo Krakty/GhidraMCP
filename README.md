@@ -143,6 +143,8 @@ All endpoints are served on every bound port. They operate on
 | `/delete_bookmark`             | POST   | Remove bookmark(s) at address |
 | `/list_comments_for_function`  | GET    | All comments in a function body |
 | `/get_callgraph`                | GET    | BFS callgraph slice (callees/callers/both, depth-limited) |
+| `/list_scripts`                | GET    | Enumerate Ghidra scripts visible to run_script |
+| `/run_script`                  | POST   | Run a named or inline Python script; captures stdout/stderr/exit |
 | `/dump/{uuid}`                 | GET    | Stream a spooled large response      |
 | `/dump/{uuid}`                 | DELETE | Explicit cleanup of a spooled file   |
 | `/dump`                        | GET    | List active spooled files            |

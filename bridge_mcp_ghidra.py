@@ -638,6 +638,84 @@ def rename_functions_bulk(header: str, strip_suffix: str = None) -> dict:
     return safe_post_json("rename_functions_bulk", payload)
 
 
+# ----------------------------------------------------------------------------
+# Script execution: /run_script + /list_scripts
+# ----------------------------------------------------------------------------
+
+@mcp.tool()
+def list_scripts(offset: int = 0, limit: int = 500,
+                 category: str = None, pattern: str = None,
+                 language: str = None, to_file: bool = False):
+    """
+    Enumerate Ghidra scripts visible to run_script.
+
+    Walks every directory in Ghidra's script-source path (the install's bundled
+    scripts plus ~/ghidra_scripts/) and returns metadata per script:
+    {name, path, language, category, description}.
+
+    Args:
+        category: substring filter on the script's category path (e.g. "FunctionID")
+        pattern:  substring filter on the script name or full path
+        language: substring filter on the runtime language (e.g. "Python", "Java")
+        to_file:  spool the response (useful for big installs with hundreds of scripts)
+    """
+    params = {"offset": offset, "limit": limit}
+    if category: params["category"] = category
+    if pattern:  params["pattern"]  = pattern
+    if language: params["language"] = language
+    if to_file:  params["to_file"]  = "true"
+    return safe_get_json("list_scripts", params)
+
+
+@mcp.tool()
+def run_script(script_name: str = None, script_body: str = None,
+               args: list = None, to_file: bool = False,
+               transaction_name: str = None) -> dict:
+    """
+    Execute a Ghidra script against the program bound to this MCP server.
+
+    Exactly one of script_name or script_body must be supplied.
+      script_name: name of an installed script (e.g. "ApplySig.py"). Discover
+                   available names via list_scripts.
+      script_body: raw Python source text. The plugin stages it as a temp
+                   inline script under <project>/.mcp_inline_scripts/, runs
+                   it, and deletes the file in finally — regardless of
+                   success or failure.
+
+    Inside an inline script_body, the standard Ghidra GhidraScript context is
+    available: currentProgram, currentAddress, currentSelection, monitor,
+    plus the flat API (getFunctionAt, parseAddress, getBytes, etc.) and the
+    full ghidra.* / java.* import surface via PyGhidra/JPype.
+
+    Args:
+        args:             list of strings passed to the script as
+                          script.getScriptArgs(). Order-preserving.
+        to_file:          when True, stdout spools to disk and the response
+                          contains stdout_url to curl (Tier 0 pattern).
+                          Recommended for scripts that produce large output.
+        transaction_name: override the default transaction label for the
+                          mutation; useful when you want a meaningful Undo
+                          label in the Ghidra GUI.
+
+    Returns dict:
+        {script, exit_code, runtime_ms, stdout|stdout_url, stderr}.
+        exit_code is 0 on success, 1 if the script raised an exception
+        during execute(), 2 if the script failed to load. stderr always
+        carries the traceback when exit_code != 0.
+
+    Transactions: mutations are wrapped in a single transaction (so the
+    whole script is one undo step in the Ghidra GUI). Scripts that open
+    their own nested transactions get Ghidra's standard nesting behaviour.
+    """
+    payload = {}
+    if script_name is not None:      payload["script_name"] = script_name
+    if script_body is not None:      payload["script_body"] = script_body
+    if args is not None:             payload["args"] = "\n".join(str(a) for a in args)
+    if to_file:                      payload["to_file"] = "true"
+    if transaction_name is not None: payload["transaction_name"] = transaction_name
+    return safe_post_json("run_script", payload)
+
+
 @mcp.tool()
 def list_bookmarks(offset: int = 0, limit: int = 200,
                    category: str = None, type: str = None,
