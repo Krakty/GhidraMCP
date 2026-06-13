@@ -1,15 +1,23 @@
-name: Build with Maven
+name: Build
+
+# Runs on every push to main / develop and on PRs targeting develop.
+# Builds the artifact + uploads it for download from the workflow run page;
+# the actual published release flow is in release.yml (triggered by a vX.Y.Z tag).
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "develop" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "develop" ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
+      # Bump these when NSA ships a newer public Ghidra you want CI to target.
+      # The plugin's deploy script auto-patches ghidraVersion= at install time
+      # against whatever the target host runs, so this version only governs
+      # what we compile against in CI — not what end users install against.
       GHIDRA_VERSION: 11.3.2
       GHIDRA_DATE: 20250415
       GHIDRA_LIBS: >-
@@ -24,6 +32,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
     - name: Set up JDK 21
       uses: actions/setup-java@v4
       with:
@@ -33,29 +42,32 @@ jobs:
 
     - name: Download Ghidra
       run: |
-        wget --no-verbose -O ghidra.zip https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${{ env.GHIDRA_VERSION }}_build/ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC_${{ env.GHIDRA_DATE }}.zip
+        wget --no-verbose -O ghidra.zip \
+          "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip"
         7z x -bd ghidra.zip
 
-    - name: Copy Ghidra libs
+    - name: Stage Ghidra libs into lib/
       run: |
         mkdir -p ./lib
-        for libfile in ${{ env.GHIDRA_LIBS }}
-          do echo "Copying ${libfile} to lib/"
-          cp ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC/Ghidra/${libfile} ./lib/
+        for libfile in ${GHIDRA_LIBS}; do
+          cp "ghidra_${GHIDRA_VERSION}_PUBLIC/Ghidra/${libfile}" ./lib/
         done
 
-    - name: Build with Maven
-      run: mvn clean package assembly:single
+    - name: Build (mvn clean package)
+      run: mvn -B clean package
 
-    - name: Assemble release directory
-      run: |
-        mkdir release
-        cp target/GhidraMCP-*-SNAPSHOT.zip release/
-        cp bridge_mcp_ghidra.py release/
-
-    - name: Upload artifact
+    - name: Upload extension zip as workflow artifact
       uses: actions/upload-artifact@v4
       with:
-        name: GhidraMCP-artifact
-        path: |
-          release/*
+        name: GhidraMCPMultiProgram-zip
+        path: target/GhidraMCPMultiProgram-*.zip
+        if-no-files-found: error
+        retention-days: 30
+
+    - name: Upload bridge as workflow artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: bridge-script
+        path: bridge_mcp_ghidra.py
+        if-no-files-found: error
+        retention-days: 30
