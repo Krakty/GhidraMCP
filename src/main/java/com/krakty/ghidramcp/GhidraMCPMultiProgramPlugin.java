@@ -3544,8 +3544,24 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         }
 
         long runtimeMs = System.currentTimeMillis() - t0;
+        String stdoutStr = stdoutBuf.toString();
+        String stderrStr = stderrBuf.toString();
+
+        // PyGhidra script provider catches Python exceptions internally and
+        // prints the traceback to the stdout PrintWriter. That defeats the
+        // exit_code semantics ("did the script work?"). Reclassify after the
+        // fact: if a Python traceback marker appears in stdout, treat as
+        // failure, move the traceback to stderr.
+        if (exitCode == 0 && stdoutStr.contains("Traceback (most recent call last)")) {
+            int tbIdx = stdoutStr.indexOf("Traceback (most recent call last)");
+            String trace = stdoutStr.substring(tbIdx);
+            stdoutStr = stdoutStr.substring(0, tbIdx);
+            stderrStr = (stderrStr.isEmpty() ? "" : stderrStr + "\n") + trace;
+            exitCode = 1;
+        }
+
         return scriptResponseEnvelope(exchange, scriptName, exitCode, runtimeMs,
-            stdoutBuf.toString(), stderrBuf.toString(), toFile);
+            stdoutStr, stderrStr, toFile);
     }
 
     /**
