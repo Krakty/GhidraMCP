@@ -92,7 +92,7 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
      * singleton, no cross-tool coordination, no discovery server. Each port
      * exposes a /info endpoint clients can scan to discover what's bound.
      */
-    public  static final String PLUGIN_VERSION = "0.2.1";
+    public  static final String PLUGIN_VERSION = "0.3.0";
     private static final int PORT_RANGE_LOW  = 8090;
     private static final int PORT_RANGE_HIGH = 8099;
 
