@@ -18,8 +18,8 @@ jobs:
       # The plugin's deploy script auto-patches ghidraVersion= at install time
       # against whatever the target host runs, so this version only governs
       # what we compile against in CI — not what end users install against.
-      GHIDRA_VERSION: 11.3.2
-      GHIDRA_DATE: 20250415
+      GHIDRA_VERSION: 12.1.2
+      GHIDRA_DATE: 20260605
       GHIDRA_LIBS: >-
         Features/Base/lib/Base.jar
         Features/Decompiler/lib/Decompiler.jar
