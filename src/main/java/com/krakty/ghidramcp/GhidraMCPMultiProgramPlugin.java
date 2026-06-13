@@ -690,6 +690,12 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         server.createContext("/dump/", exchange -> handleDumpById(exchange));
         server.createContext("/dump",  exchange -> handleDumpList(exchange));
 
+        // Open a program from the project into this CodeBrowser tool.
+        server.createContext("/open_program", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJson(exchange, openProgramFromProject(params.get("path")));
+        });
+
         // Version Tracking endpoints
         server.createContext("/vt_list_sessions", exchange -> {
             sendJson(exchange, vtListSessions());
@@ -4183,6 +4189,39 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
             sendJson(exchange, "{\"error\":\"list failed: "
                 + jsonEscape(e.getMessage()) + "\"}");
         }
+    }
+
+    // ---- Program open --------------------------------------------------------
+
+    private String openProgramFromProject(String projectPath) {
+        if (projectPath == null || projectPath.isBlank())
+            return "{\"error\":\"path is required\"}";
+
+        ghidra.framework.model.Project project = tool.getProject();
+        if (project == null) return "{\"error\":\"No project open\"}";
+
+        String fullPath = projectPath.startsWith("/") ? projectPath : "/" + projectPath;
+        DomainFile file = project.getProjectData().getFile(fullPath);
+        if (file == null)
+            return "{\"error\":\"File not found: " + jsonEscape(fullPath) + "\"}";
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        String[] errorHolder = {null};
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                ProgramManager pm = tool.getService(ProgramManager.class);
+                if (pm == null) { errorHolder[0] = "ProgramManager not available"; return; }
+                Program p = pm.openProgram(file);
+                success.set(p != null);
+                if (p == null) errorHolder[0] = "openProgram returned null";
+            });
+        }
+        catch (InvocationTargetException | InterruptedException e) {
+            return "{\"error\":" + jsonString(e.getMessage()) + "}";
+        }
+        if (!success.get())
+            return "{\"error\":" + jsonString(errorHolder[0] != null ? errorHolder[0] : "open failed") + "}";
+        return "{\"opened\":" + jsonString(fullPath) + "}";
     }
 
     // ---- Version Tracking endpoints ------------------------------------------

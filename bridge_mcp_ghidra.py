@@ -871,6 +871,16 @@ def program_info() -> dict:
 
 
 @mcp.tool()
+def open_program(path: str) -> dict:
+    """
+    Open a program from the Ghidra project into this CodeBrowser tool.
+    path: project path (e.g. "/3-16-2026-test-eqgame.exe"). Leading / optional.
+    Returns {"opened": path} on success.
+    """
+    return safe_post_json("open_program", {"path": path})
+
+
+@mcp.tool()
 def vt_list_sessions() -> dict:
     """
     List all Version Tracking sessions in the current Ghidra project.
