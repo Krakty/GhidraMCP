@@ -106,7 +106,7 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
      */
     public  static final String PLUGIN_VERSION = "0.3.0";
     private static final int PORT_RANGE_LOW  = 8090;
-    private static final int PORT_RANGE_HIGH = 8099;
+    private static final int PORT_RANGE_HIGH = 8129;
 
     private HttpServer server;
     private int boundPort = -1;
