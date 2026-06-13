@@ -76,6 +76,18 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+// Version Tracking
+import ghidra.feature.vt.api.db.VTSessionDB;
+import ghidra.feature.vt.api.db.VTSessionContentHandler;
+import ghidra.feature.vt.api.main.*;
+import ghidra.feature.vt.api.correlator.program.*;
+import ghidra.feature.vt.api.markuptype.*;
+import ghidra.feature.vt.api.util.VTOptions;
+import ghidra.feature.vt.api.util.VersionTrackingApplyException;
+import ghidra.framework.model.DomainFile;
+import ghidra.framework.model.DomainFolder;
+import ghidra.program.model.address.AddressSetView;
+
 @PluginInfo(
     status = PluginStatus.RELEASED,
     packageName = ghidra.app.DeveloperPluginPackage.NAME,
@@ -677,6 +689,50 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         // ID requests, "/dump" catches the list path.
         server.createContext("/dump/", exchange -> handleDumpById(exchange));
         server.createContext("/dump",  exchange -> handleDumpList(exchange));
+
+        // Version Tracking endpoints
+        server.createContext("/vt_list_sessions", exchange -> {
+            sendJson(exchange, vtListSessions());
+        });
+
+        server.createContext("/vt_create_session", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJson(exchange, vtCreateSession(
+                params.get("name"),
+                params.get("source_program"),
+                params.get("dest_program")));
+        });
+
+        server.createContext("/vt_run_correlators", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJson(exchange, vtRunCorrelators(
+                params.get("session"),
+                params.get("algorithms")));
+        });
+
+        server.createContext("/vt_list_matches", exchange -> {
+            Map<String, String> qp = parseQueryParams(exchange);
+            sendJson(exchange, vtListMatches(
+                qp.get("session"),
+                qp.get("min_score"),
+                qp.get("status"),
+                parseIntOrDefault(qp.get("offset"), 0),
+                parseIntOrDefault(qp.get("limit"), 200)));
+        });
+
+        server.createContext("/vt_accept_matches", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJson(exchange, vtAcceptMatches(
+                params.get("session"),
+                params.get("min_score")));
+        });
+
+        server.createContext("/vt_apply_markups", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJson(exchange, vtApplyMarkups(
+                params.get("session"),
+                params.get("types")));
+        });
 
         server.setExecutor(null);
         new Thread(() -> {
@@ -4126,6 +4182,346 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         catch (IOException e) {
             sendJson(exchange, "{\"error\":\"list failed: "
                 + jsonEscape(e.getMessage()) + "\"}");
+        }
+    }
+
+    // ---- Version Tracking endpoints ------------------------------------------
+
+    private VTSession vtOpenSession(String sessionPath) throws Exception {
+        ghidra.framework.model.Project project = tool.getProject();
+        if (project == null) throw new IllegalStateException("No project open");
+        ghidra.framework.model.ProjectData pd = project.getProjectData();
+        String fullPath = sessionPath.startsWith("/") ? sessionPath : "/" + sessionPath;
+        DomainFile file = pd.getFile(fullPath);
+        if (file == null)
+            throw new IllegalArgumentException("Session not found: " + fullPath);
+        if (!VTSessionContentHandler.CONTENT_TYPE.equals(file.getContentType()))
+            throw new IllegalArgumentException("Not a VT session: " + fullPath);
+        return (VTSession) file.getDomainObject(this, false, false, new ConsoleTaskMonitor());
+    }
+
+    private String vtListSessions() {
+        ghidra.framework.model.Project project = tool.getProject();
+        if (project == null) return "{\"error\":\"No project open\"}";
+        try {
+            List<String> paths = new ArrayList<>();
+            collectVtSessionPaths(project.getProjectData().getRootFolder(), paths);
+            StringBuilder sb = new StringBuilder("{\"sessions\":[");
+            for (int i = 0; i < paths.size(); i++) {
+                if (i > 0) sb.append(",");
+                sb.append(jsonString(paths.get(i)));
+            }
+            return sb.append("]}").toString();
+        }
+        catch (Exception e) {
+            return "{\"error\":" + jsonString(e.getMessage()) + "}";
+        }
+    }
+
+    private void collectVtSessionPaths(DomainFolder folder, List<String> out) {
+        for (DomainFile f : folder.getFiles()) {
+            if (VTSessionContentHandler.CONTENT_TYPE.equals(f.getContentType()))
+                out.add(f.getPathname());
+        }
+        for (DomainFolder sub : folder.getFolders())
+            collectVtSessionPaths(sub, out);
+    }
+
+    private String vtCreateSession(String sessionName, String sourcePath, String destPath) {
+        if (sessionName == null || sessionName.isBlank())
+            return "{\"error\":\"name is required\"}";
+        if (sourcePath == null || sourcePath.isBlank())
+            return "{\"error\":\"source_program is required\"}";
+        if (destPath == null || destPath.isBlank())
+            return "{\"error\":\"dest_program is required\"}";
+
+        ghidra.framework.model.Project project = tool.getProject();
+        if (project == null) return "{\"error\":\"No project open\"}";
+
+        String srcFull  = sourcePath.startsWith("/") ? sourcePath : "/" + sourcePath;
+        String destFull = destPath.startsWith("/")   ? destPath   : "/" + destPath;
+
+        ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+        ghidra.framework.model.ProjectData pd = project.getProjectData();
+        DomainFile sourceFile = pd.getFile(srcFull);
+        DomainFile destFile   = pd.getFile(destFull);
+        if (sourceFile == null)
+            return "{\"error\":\"source not found: " + jsonEscape(srcFull) + "\"}";
+        if (destFile == null)
+            return "{\"error\":\"dest not found: " + jsonEscape(destFull) + "\"}";
+
+        Program sourceProgram = null;
+        Program destProgram   = null;
+        VTSession session     = null;
+        try {
+            sourceProgram = (Program) sourceFile.getDomainObject(this, false, false, monitor);
+            destProgram   = (Program) destFile.getDomainObject(this, false, false, monitor);
+            if (!destProgram.canSave())
+                return "{\"error\":\"dest program is read-only\"}";
+
+            DomainFolder root = pd.getRootFolder();
+            if (root.getFile(sessionName) != null)
+                return "{\"error\":\"session already exists: " + jsonEscape(sessionName) + "\"}";
+
+            session = new VTSessionDB(sessionName, sourceProgram, destProgram, this);
+            root.createFile(sessionName, session, monitor);
+            session.save();
+            return "{\"created\":" + jsonString(sessionName)
+                + ",\"source\":" + jsonString(srcFull)
+                + ",\"dest\":" + jsonString(destFull) + "}";
+        }
+        catch (Exception e) {
+            return "{\"error\":" + jsonString(e.getMessage()) + "}";
+        }
+        finally {
+            if (session != null)      session.release(this);
+            if (sourceProgram != null) sourceProgram.release(this);
+            if (destProgram != null)   destProgram.release(this);
+        }
+    }
+
+    private VTProgramCorrelatorFactory vtCorrelatorForName(String name) {
+        switch (name.toLowerCase().trim()) {
+            case "exact_bytes":        return new ExactMatchBytesProgramCorrelatorFactory();
+            case "exact_instructions": return new ExactMatchInstructionsProgramCorrelatorFactory();
+            case "exact_data":         return new ExactDataMatchProgramCorrelatorFactory();
+            case "duplicate":          return new DuplicateFunctionMatchProgramCorrelatorFactory();
+            case "reference":          return new CombinedFunctionAndDataReferenceProgramCorrelatorFactory();
+            case "similar_symbol":     return new SimilarSymbolNameProgramCorrelatorFactory();
+            default:                   return null;
+        }
+    }
+
+    private String vtRunCorrelators(String sessionPath, String algorithms) {
+        if (sessionPath == null || sessionPath.isBlank())
+            return "{\"error\":\"session is required\"}";
+
+        List<String> algoList = new ArrayList<>();
+        if (algorithms == null || algorithms.isBlank()) {
+            algoList.add("exact_bytes");
+            algoList.add("exact_instructions");
+            algoList.add("exact_data");
+            algoList.add("duplicate");
+        }
+        else {
+            for (String a : algorithms.split(",")) {
+                String t = a.trim();
+                if (!t.isEmpty()) algoList.add(t);
+            }
+        }
+
+        VTSession session = null;
+        try {
+            session = vtOpenSession(sessionPath);
+            Program srcProg  = session.getSourceProgram();
+            Program destProg = session.getDestinationProgram();
+            AddressSetView srcAddrs  = srcProg.getMemory().getLoadedAndInitializedAddressSet();
+            AddressSetView destAddrs = destProg.getMemory().getLoadedAndInitializedAddressSet();
+            ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+
+            StringBuilder results = new StringBuilder("[");
+            boolean first = true;
+            int tx = session.startTransaction("Run correlators via MCP");
+            try {
+                for (String algo : algoList) {
+                    VTProgramCorrelatorFactory factory = vtCorrelatorForName(algo);
+                    if (factory == null) {
+                        if (!first) results.append(",");
+                        first = false;
+                        results.append("{\"algorithm\":").append(jsonString(algo))
+                               .append(",\"error\":\"unknown algorithm\"}");
+                        continue;
+                    }
+                    VTOptions options = factory.createDefaultOptions();
+                    VTProgramCorrelator correlator = factory.createCorrelator(
+                        srcProg, srcAddrs, destProg, destAddrs, options);
+                    VTMatchSet matchSet = correlator.correlate(session, monitor);
+                    int count = (matchSet != null) ? matchSet.getMatchCount() : 0;
+                    if (!first) results.append(",");
+                    first = false;
+                    results.append("{\"algorithm\":").append(jsonString(algo))
+                           .append(",\"matches\":").append(count).append("}");
+                }
+            }
+            finally {
+                session.endTransaction(tx, true);
+                session.save();
+            }
+            results.append("]");
+            return "{\"correlators\":" + results + "}";
+        }
+        catch (Exception e) {
+            return "{\"error\":" + jsonString(e.getMessage()) + "}";
+        }
+        finally {
+            if (session != null) session.release(this);
+        }
+    }
+
+    private String vtListMatches(String sessionPath, String minScoreStr,
+                                  String statusFilter, int offset, int limit) {
+        if (sessionPath == null || sessionPath.isBlank())
+            return "{\"error\":\"session is required\"}";
+
+        VTSession session = null;
+        try {
+            session = vtOpenSession(sessionPath);
+            double minScore = 0.0;
+            if (minScoreStr != null && !minScoreStr.isBlank())
+                minScore = Double.parseDouble(minScoreStr);
+
+            List<String> entries = new ArrayList<>();
+            for (VTMatchSet ms : session.getMatchSets()) {
+                for (VTMatch match : ms.getMatches()) {
+                    VTAssociation assoc = match.getAssociation();
+                    VTAssociationStatus s = assoc.getStatus();
+                    if (statusFilter != null && !statusFilter.equalsIgnoreCase("all")) {
+                        if (!s.name().equalsIgnoreCase(statusFilter)) continue;
+                    }
+                    double score = match.getSimilarityScore().getScore();
+                    if (score < minScore) continue;
+                    entries.add("{\"src\":" + jsonString(match.getSourceAddress().toString())
+                        + ",\"dst\":" + jsonString(match.getDestinationAddress().toString())
+                        + ",\"score\":" + score
+                        + ",\"confidence\":" + match.getConfidenceScore().getScore()
+                        + ",\"status\":" + jsonString(s.name())
+                        + ",\"type\":" + jsonString(assoc.getType().name())
+                        + "}");
+                }
+            }
+
+            int total = entries.size();
+            List<String> page = entries.subList(
+                Math.min(offset, total), Math.min(offset + limit, total));
+            StringBuilder sb = new StringBuilder("{\"total\":").append(total)
+                .append(",\"offset\":").append(offset)
+                .append(",\"matches\":[");
+            for (int i = 0; i < page.size(); i++) {
+                if (i > 0) sb.append(",");
+                sb.append(page.get(i));
+            }
+            return sb.append("]}").toString();
+        }
+        catch (Exception e) {
+            return "{\"error\":" + jsonString(e.getMessage()) + "}";
+        }
+        finally {
+            if (session != null) session.release(this);
+        }
+    }
+
+    private String vtAcceptMatches(String sessionPath, String minScoreStr) {
+        if (sessionPath == null || sessionPath.isBlank())
+            return "{\"error\":\"session is required\"}";
+
+        VTSession session = null;
+        try {
+            session = vtOpenSession(sessionPath);
+            double minScore = 0.0;
+            if (minScoreStr != null && !minScoreStr.isBlank())
+                minScore = Double.parseDouble(minScoreStr);
+
+            int accepted = 0, skipped = 0;
+            int tx = session.startTransaction("Accept matches via MCP");
+            try {
+                for (VTMatchSet ms : session.getMatchSets()) {
+                    for (VTMatch match : ms.getMatches()) {
+                        VTAssociation assoc = match.getAssociation();
+                        if (assoc.getStatus() != VTAssociationStatus.AVAILABLE) {
+                            skipped++;
+                            continue;
+                        }
+                        if (match.getSimilarityScore().getScore() < minScore) {
+                            skipped++;
+                            continue;
+                        }
+                        assoc.setAccepted();
+                        accepted++;
+                    }
+                }
+            }
+            finally {
+                session.endTransaction(tx, true);
+                session.save();
+            }
+            return "{\"accepted\":" + accepted + ",\"skipped\":" + skipped + "}";
+        }
+        catch (Exception e) {
+            return "{\"error\":" + jsonString(e.getMessage()) + "}";
+        }
+        finally {
+            if (session != null) session.release(this);
+        }
+    }
+
+    private boolean vtMarkupTypeWanted(VTMarkupType markupType, Set<String> wanted) {
+        if (wanted.contains("function_name") && markupType == FunctionNameMarkupType.INSTANCE) return true;
+        if (wanted.contains("label") && markupType == LabelMarkupType.INSTANCE) return true;
+        if (wanted.contains("function_signature") && markupType == FunctionSignatureMarkupType.INSTANCE) return true;
+        if (wanted.contains("data_type") && markupType == DataTypeMarkupType.INSTANCE) return true;
+        if (wanted.contains("eol_comment") && markupType == EolCommentMarkupType.INSTANCE) return true;
+        if (wanted.contains("plate_comment") && markupType == PlateCommentMarkupType.INSTANCE) return true;
+        return false;
+    }
+
+    private String vtApplyMarkups(String sessionPath, String typesStr) {
+        if (sessionPath == null || sessionPath.isBlank())
+            return "{\"error\":\"session is required\"}";
+
+        Set<String> wantedTypes = new HashSet<>();
+        if (typesStr == null || typesStr.isBlank()) {
+            wantedTypes.add("function_name");
+            wantedTypes.add("label");
+        }
+        else {
+            for (String t : typesStr.split(","))
+                wantedTypes.add(t.trim().toLowerCase());
+        }
+
+        VTSession session = null;
+        try {
+            session = vtOpenSession(sessionPath);
+            ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+            int applied = 0, failed = 0, skipped = 0;
+            int tx = session.startTransaction("Apply markups via MCP");
+            try {
+                for (VTMatchSet ms : session.getMatchSets()) {
+                    for (VTMatch match : ms.getMatches()) {
+                        VTAssociation assoc = match.getAssociation();
+                        if (assoc.getStatus() != VTAssociationStatus.ACCEPTED) continue;
+                        for (VTMarkupItem item : assoc.getMarkupItems(monitor)) {
+                            if (!vtMarkupTypeWanted(item.getMarkupType(), wantedTypes)) {
+                                skipped++;
+                                continue;
+                            }
+                            if (!item.canApply()) {
+                                skipped++;
+                                continue;
+                            }
+                            try {
+                                item.apply(VTMarkupItemApplyActionType.REPLACE, null);
+                                applied++;
+                            }
+                            catch (VersionTrackingApplyException e) {
+                                failed++;
+                            }
+                        }
+                    }
+                }
+            }
+            finally {
+                session.endTransaction(tx, true);
+                try { session.getDestinationProgram().save("VT markups via MCP", monitor); }
+                catch (Exception ignore) {}
+                session.save();
+            }
+            return "{\"applied\":" + applied + ",\"failed\":" + failed + ",\"skipped\":" + skipped + "}";
+        }
+        catch (Exception e) {
+            return "{\"error\":" + jsonString(e.getMessage()) + "}";
+        }
+        finally {
+            if (session != null) session.release(this);
         }
     }
 

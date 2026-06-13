@@ -870,6 +870,106 @@ def program_info() -> dict:
     }
 
 
+@mcp.tool()
+def vt_list_sessions() -> dict:
+    """
+    List all Version Tracking sessions in the current Ghidra project.
+    Returns {"sessions": ["/SessionName", ...]} with full project paths.
+    """
+    return safe_get_json("vt_list_sessions")
+
+
+@mcp.tool()
+def vt_create_session(name: str, source_program: str, dest_program: str) -> dict:
+    """
+    Create a new Version Tracking session in the current Ghidra project.
+    name: session name (stored as /name in project root).
+    source_program: project path to the annotated/known binary (e.g. "/old_eqgame.exe").
+    dest_program: project path to the new binary to annotate (e.g. "/new_eqgame.exe").
+    Returns {"created": name, "source": path, "dest": path} on success.
+    """
+    return safe_post_json("vt_create_session", {
+        "name": name,
+        "source_program": source_program,
+        "dest_program": dest_program,
+    })
+
+
+@mcp.tool()
+def vt_run_correlators(session: str, algorithms: str = "") -> dict:
+    """
+    Run matching correlators on a VT session to find function/data matches.
+    WARNING: This is slow -- can take minutes for large binaries. Blocks until done.
+    session: session path (e.g. "/MySession").
+    algorithms: comma-separated list from: exact_bytes, exact_instructions, exact_data,
+                duplicate, reference, similar_symbol.
+                Default (empty): exact_bytes, exact_instructions, exact_data, duplicate.
+    Returns {"correlators": [{"algorithm": name, "matches": count}, ...]}.
+    """
+    url = urljoin(ghidra_server_url, "vt_run_correlators")
+    data: dict = {"session": session}
+    if algorithms:
+        data["algorithms"] = algorithms
+    try:
+        response = requests.post(url, data=data, timeout=600)
+        response.encoding = "utf-8"
+        if not response.ok:
+            return {"error": f"HTTP {response.status_code}: {response.text.strip()}"}
+        return response.json()
+    except ValueError as e:
+        return {"error": f"JSON decode failed: {e}"}
+    except Exception as e:
+        return {"error": f"Request failed: {e}"}
+
+
+@mcp.tool()
+def vt_list_matches(session: str, min_score: float = 0.0, status: str = "all",
+                    offset: int = 0, limit: int = 200) -> dict:
+    """
+    List matches from a VT session.
+    session: session path (e.g. "/MySession").
+    min_score: minimum similarity score (0.0 to 1.0, default 0.0 = all).
+    status: filter by AVAILABLE, ACCEPTED, REJECTED, or all (default).
+    Returns {"total": N, "offset": N, "matches": [{src, dst, score, confidence, status, type}]}.
+    """
+    return safe_get_json("vt_list_matches", {
+        "session": session,
+        "min_score": min_score,
+        "status": status,
+        "offset": offset,
+        "limit": limit,
+    })
+
+
+@mcp.tool()
+def vt_accept_matches(session: str, min_score: float = 0.0) -> dict:
+    """
+    Accept all AVAILABLE matches at or above min_score in a VT session.
+    session: session path (e.g. "/MySession").
+    min_score: minimum similarity score required to accept (default 0.0 = accept all available).
+    Returns {"accepted": N, "skipped": N}.
+    """
+    return safe_post_json("vt_accept_matches", {
+        "session": session,
+        "min_score": min_score,
+    })
+
+
+@mcp.tool()
+def vt_apply_markups(session: str, types: str = "") -> dict:
+    """
+    Apply markups from accepted VT matches to the destination program and save it.
+    session: session path (e.g. "/MySession").
+    types: comma-separated subset of: function_name, label, function_signature,
+           data_type, eol_comment, plate_comment. Default (empty): function_name, label.
+    Returns {"applied": N, "failed": N, "skipped": N}.
+    """
+    data: dict = {"session": session}
+    if types:
+        data["types"] = types
+    return safe_post_json("vt_apply_markups", data)
+
+
 def _identify_program() -> None:
     """
     Hit /info once at startup, cache the payload, and stamp a human-readable

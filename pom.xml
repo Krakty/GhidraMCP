@@ -68,6 +68,20 @@
       <scope>system</scope>
       <systemPath>${project.basedir}/lib/Gui.jar</systemPath>
     </dependency>
+    <dependency>
+      <groupId>ghidra</groupId>
+      <artifactId>VersionTracking</artifactId>
+      <version>12.1.2</version>
+      <scope>system</scope>
+      <systemPath>${project.basedir}/lib/VersionTracking.jar</systemPath>
+    </dependency>
+    <dependency>
+      <groupId>ghidra</groupId>
+      <artifactId>DB</artifactId>
+      <version>12.1.2</version>
+      <scope>system</scope>
+      <systemPath>${project.basedir}/lib/DB.jar</systemPath>
+    </dependency>
 
     <!-- JUnit (test only) -->
     <dependency>

@@ -27,6 +27,8 @@ jobs:
         Framework/SoftwareModeling/lib/SoftwareModeling.jar
         Framework/Utility/lib/Utility.jar
         Framework/Gui/lib/Gui.jar
+        Features/VersionTracking/lib/VersionTracking.jar
+        Framework/DB/lib/DB.jar
 
     steps:
     - uses: actions/checkout@v4
