@@ -1,0 +1,83 @@
+name: Release
+
+# Triggered by pushing a vX.Y.Z tag. Builds the plugin against the same Ghidra
+# version as the main build workflow, then creates a DRAFT GitHub Release with
+# the zip attached. A human reviews the release notes and clicks Publish —
+# nothing goes live without that manual gate.
+
+on:
+  push:
+    tags: [ "v[0-9]+.[0-9]+.[0-9]+" ]
+
+permissions:
+  contents: write   # required to create a GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GHIDRA_VERSION: 11.3.2
+      GHIDRA_DATE: 20250415
+      GHIDRA_LIBS: >-
+        Features/Base/lib/Base.jar
+        Features/Decompiler/lib/Decompiler.jar
+        Framework/Docking/lib/Docking.jar
+        Framework/Generic/lib/Generic.jar
+        Framework/Project/lib/Project.jar
+        Framework/SoftwareModeling/lib/SoftwareModeling.jar
+        Framework/Utility/lib/Utility.jar
+        Framework/Gui/lib/Gui.jar
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Download Ghidra
+      run: |
+        wget --no-verbose -O ghidra.zip \
+          "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip"
+        7z x -bd ghidra.zip
+
+    - name: Stage Ghidra libs into lib/
+      run: |
+        mkdir -p ./lib
+        for libfile in ${GHIDRA_LIBS}; do
+          cp "ghidra_${GHIDRA_VERSION}_PUBLIC/Ghidra/${libfile}" ./lib/
+        done
+
+    - name: Build (mvn clean package)
+      run: mvn -B clean package
+
+    - name: Locate built zip
+      id: artifact
+      run: |
+        ZIP=$(ls target/GhidraMCPMultiProgram-*.zip | head -1)
+        if [[ -z "$ZIP" || ! -f "$ZIP" ]]; then
+          echo "build did not produce a zip" >&2
+          exit 1
+        fi
+        echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+        echo "name=$(basename "$ZIP")" >> "$GITHUB_OUTPUT"
+
+    - name: Create draft GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        draft: true
+        tag_name: ${{ github.ref_name }}
+        name: ${{ github.ref_name }}
+        generate_release_notes: true
+        body: |
+          Auto-built from tag `${{ github.ref_name }}`.
+
+          **Install:** download `${{ steps.artifact.outputs.name }}`,
+          then in Ghidra: **File → Install Extensions → +** → select the .zip → restart Ghidra.
+
+          A maintainer should fill in the substantive release notes before
+          clicking **Publish release**.
+        files: ${{ steps.artifact.outputs.zip }}
