@@ -93,7 +93,7 @@ import ghidra.program.model.address.AddressSetView;
     packageName = ghidra.app.DeveloperPluginPackage.NAME,
     category = PluginCategoryNames.ANALYSIS,
     shortDescription = "GhidraMCP Multi-Program HTTP server plugin (Krakty)",
-    description = "Per-tool HTTP server: each CodeBrowser binds its own port in 8090-8099 and serves the active program. Clients use /info on each port for discovery."
+    description = "Per-tool HTTP server: each CodeBrowser binds its own port in 8090-8129 and serves the active program. Clients use /info on each port for discovery."
 )
 public class GhidraMCPMultiProgramPlugin extends Plugin {
 

@@ -5,8 +5,7 @@ makes the plugin **per-tool**: each open Ghidra CodeBrowser window binds its
 own HTTP server on a unique port, so MCP clients can address multiple loaded
 programs in parallel without GUI program-switching.
 
-Built and tested against **Ghidra 12.1** (previously 12.0.4 — see HANDOFF.md
-for the upgrade record).
+Built and tested against **Ghidra 12.1.2** (previously 12.0.4).
 
 > **End-user docs live in [README.md](README.md).** This file is the design /
 > decision log: architecture choices, gotchas, and history. Read README first
@@ -17,7 +16,7 @@ for the upgrade record).
 The plugin is loaded once per `PluginTool` instance (Ghidra default behavior;
 each CodeBrowser window is its own tool). On startup, each instance:
 
-1. Tries to bind an HTTP server to the first free port in **8090-8099**.
+1. Tries to bind an HTTP server to the first free port in **8090-8129**.
 2. Fails silently and tries the next port if a port is already taken.
 3. Exposes the upstream endpoint set (`/methods`, `/decompile`, etc.) plus a
    new `/info` endpoint, all operating on `getCurrentProgram()` — which is
@@ -33,7 +32,7 @@ Each port serves a JSON discovery payload:
 ```json
 GET /info
 {
-  "version":    "0.2.1",
+  "version":    "0.3.0",
   "port":       8090,
   "toolName":   "CodeBrowser",
   "name":       "05-22-2026-LIVE-eqgame.exe",
@@ -49,7 +48,7 @@ GET /info
 - `datePrefix` is `MM-DD-YYYY` extracted from the start of `name`, or empty.
 
 Clients (MCP bridge, Claude, scripts) discover what's bound by hitting
-`/info` on each port in 8090-8099 and ignoring the ones that don't respond.
+`/info` on each port in 8090-8129 and ignoring the ones that don't respond.
 
 ## Build & install
 
@@ -62,7 +61,7 @@ resulting ZIP.
 
 Two version numbers, deliberately separate:
 
-- **Plugin version** (e.g. `0.2.1`) — tracks fork changes (features, fixes).
+- **Plugin version** (e.g. `0.3.0`) — tracks fork changes (features, fixes).
   Lives in `pom.xml` `<version>`, `extension.properties` `version=`, and
   `PLUGIN_VERSION` in the plugin source. Bump on every release.
 - **Ghidra version** (e.g. `12.1`) — Ghidra release this build is compatible
@@ -116,7 +115,7 @@ Architecture iterations during development:
 - **v0.2.0**: Per-tool plugin, port-per-tool, no central coordination. Each
   CodeBrowser instance is independent. Slot abstraction removed (clients use
   `/info` for discovery instead). First Ghidra 12.0.4 build.
-- **v0.2.1 (current)**:
+- **v0.2.1**:
   - Migrated build to **Ghidra 12.1.2** (was 12.0.4; passed through 12.1
     briefly while Ghidra was 12.1, then re-targeted when laptop patched
     to 12.1.2).
@@ -136,3 +135,48 @@ Architecture iterations during development:
     relied on were inlined into the plugin file. Plugin source shrank from
     2753 lines across 3 files to 1918 lines in 1 file. Stale
     `@PluginInfo.description` text was also corrected.
+- **v0.3.0 (current)**:
+  - **Port range expanded to 8090-8129 (40 ports).** Was 10 ports, which
+    ran out when many programs were open concurrently. Expanded to 40 to
+    cover sustained parallel analysis sessions.
+  - **Spool-to-disk for large responses (Tier 0).** Four endpoints
+    (`decompile_function`, `disassemble_function`, `list_functions`,
+    `list_strings`) accept `to_file=true` — response body is written to a
+    UUID-named file under `<projectDir>/.mcp_dumps/` and the JSON response
+    contains a URL + size metadata. New HTTP endpoints `GET /dump/{uuid}`,
+    `DELETE /dump/{uuid}`, `GET /dump` for streaming and cleanup. Every
+    subsequent endpoint inherits the spool pattern for free.
+  - **Tier 1 endpoint set** (~20 new endpoints): symbol-table read + label
+    delete (`/list_symbols`, `/get_symbol_at`, `/delete_label`), function
+    lifecycle (`/create_function`, `/delete_function`,
+    `/mark_function_thunk`), DataType management (`/parse_c_header`,
+    `/apply_data_type_at`, `/get_data_type`, `/list_data_types`,
+    `/set_struct_member`), bulk operations (`/apply_labels_from_header`,
+    `/rename_functions_bulk`, `/set_function_signature_bulk`), bookmarks
+    (`/list_bookmarks`, `/add_bookmark`, `/delete_bookmark`), comment
+    readback (`/list_comments_for_function`), and BFS callgraph slice
+    (`/get_callgraph`).
+  - **Script execution** (`/run_script`, `/list_scripts`). Run any installed
+    Ghidra script (Python or Java) against the current program, or post an
+    **inline Python body** that the plugin stages, executes, and deletes.
+    Scripts run in the same JVM, see the live Ghidra DB state, and are
+    transaction-wrapped for undo. Stdout/stderr/exit code/runtime are
+    returned. Bridge wrappers: `run_script()` and `list_scripts()`.
+  - **Version Tracker integration** (6 endpoints): `vt_list_sessions`,
+    `vt_create_session`, `vt_run_correlators`, `vt_list_matches`,
+    `vt_accept_matches`, `vt_apply_markups`. Enables automated VT workflows
+    (create session → run correlators → accept matches → apply markups)
+    entirely through MCP. Bridge has matching `vt_*` wrappers.
+  - **`/open_program` endpoint**: load a project file by path into a new
+    CodeBrowser tab programmatically, so the MCP agent can open programs
+    without GUI interaction.
+  - **Program-identity announcement in the bridge.** At startup, the bridge
+    hits `/info` and stamps the program identity (`MM-DD-YYYY program.ext @
+    port`) into every MCP tool description plus the MCP `serverInfo.name`.
+    With multiple bridges, Claude sees distinctly labeled tool catalogs
+    instead of indistinguishable `ghidra-*` blocks.
+  - **SSE transport support** in the bridge (`--transport sse`), enabling
+    clients that prefer a shared long-lived server (e.g. Cline's Remote
+    Servers).
+  - Plugin source grew from ~1918 to ~4200 lines due to the new endpoint
+    set + DumpManager + VT integration + script execution.

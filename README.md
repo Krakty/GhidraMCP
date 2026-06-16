@@ -9,7 +9,7 @@ tool**, so multiple programs loaded simultaneously can be addressed in parallel
 without GUI program-switching.
 
 Fork of [LaurieWired/GhidraMCP](https://github.com/LaurieWired/GhidraMCP).
-Plugin version **0.3.0**, built against **Ghidra 12.1**.
+Plugin version **0.3.0**, built against **Ghidra 12.1.2**.
 
 ---
 
@@ -84,7 +84,7 @@ GET /info
 - `datePrefix` — `MM-DD-YYYY` extracted from the leading characters of `name`,
   or empty string if no date prefix.
 
-Clients are expected to probe `/info` on every port in `8090–8099` and ignore
+Clients are expected to probe `/info` on every port in `8090–8129` and ignore
 the ones that don't respond (connection refused = no tool bound there).
 
 ---
@@ -204,13 +204,187 @@ creates a bare label when the address has no existing data definition,
 enabling bulk-labeling tools to annotate addresses that Ghidra's auto-analysis
 hasn't classified yet.
 
+### Script execution (`/run_script`, `/list_scripts`)
+
+These endpoints let you run Ghidra scripts (Python or Java) against the
+program bound to the current port — without leaving the MCP session.
+
+**`POST /run_script`** accepts either a `script_name` (an installed script
+from Ghidra's script directories) or a `script_body` (raw Python source that
+the plugin stages as a temp file, executes, and deletes in a `finally` block).
+Exactly one must be supplied; both → `400`.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `script_name` | one of the two | Name of an installed script (e.g. `ApplySig.py`) |
+| `script_body` | one of the two | Raw Python text — staged as a temp inline script |
+| `args` | optional | Tab- or newline-separated argument list |
+| `to_file` | optional | `true` → stdout spools to disk; returns URL envelope |
+| `transaction_name` | optional | Override the default transaction label |
+
+Response (default):
+
+```json
+{
+  "script": "ApplySig.py",
+  "exit_code": 0,
+  "runtime_ms": 4123,
+  "stdout": "<captured stdout>",
+  "stderr": "<captured stderr>"
+}
+```
+
+With `to_file=true`, stdout spools to disk — stderr stays inline because it's
+almost always small:
+
+```json
+{
+  "script": "ApplySig.py",
+  "exit_code": 0,
+  "runtime_ms": 4123,
+  "stdout_url": "http://host:8090/dump/script-3f2c8b9e",
+  "stdout_bytes": 47823412,
+  "stdout_lines": 412953,
+  "stderr": ""
+}
+```
+
+Scripts run in the same JVM as the plugin — no headless cold-start, and they
+see the live Ghidra DB (including in-flight changes from prior MCP calls).
+Mutations are wrapped in a transaction (undoable from the GUI). Inside the
+script body, the standard GhidraScript context is available: `currentProgram`,
+`currentAddress`, `currentSelection`, `monitor`, plus the flat API and the
+full `ghidra.*` / `java.*` import surface.
+
+The script-staging directory is `<projectDir>/.mcp_inline_scripts/`, scoped
+per-program the same way the spool dir is. Temp files are always deleted
+after execution.
+
+**`GET /list_scripts`** enumerates installed scripts visible to `run_script`:
+
+```json
+GET /list_scripts?category=FunctionID&offset=0&limit=10
+{
+  "scripts": [
+    {
+      "name": "ApplySig.py",
+      "path": "~/ghidra_scripts/ApplySig.py",
+      "language": "Python",
+      "category": "FunctionID",
+      "description": "Batch FLIRT signature apply"
+    }
+  ]
+}
+```
+
+Supports `offset`/`limit` pagination, plus optional `category`, `name_pattern`,
+and `language` query filters. Also accepts `to_file=true` (the full DTM-style
+list can be hundreds of entries on a well-populated install).
+
+**Bridge wrappers:**
+
+```python
+run_script(script_name: str = None, script_body: str = None,
+           args: list = None, to_file: bool = False,
+           transaction_name: str = None) -> dict
+
+list_scripts(offset: int = 0, limit: int = 500,
+             category: str = None, name_pattern: str = None,
+             language: str = None, to_file: bool = False) -> dict
+```
+
+### Version Tracker integration (`/vt_*`)
+
+Six endpoints wrap Ghidra's built-in Version Tracking, enabling automated
+cross-program comparison — create a session, run correlators, accept matches,
+and apply markups — all through MCP.
+
+Typical workflow:
+
+```
+create session → run correlators → list matches → accept matches → apply markups
+```
+
+**`POST /vt_create_session`**
+
+```json
+{
+  "name": "vault-vs-vault-patched",
+  "source_program": "/path/to/vault-v1.0.exe",
+  "dest_program":   "/path/to/vault-v1.1.exe"
+}
+```
+
+Returns `{ "session_id": "<uuid>", "name": "...", "source": "...", "dest": "..." }`.
+
+**`POST /vt_run_correlators`**
+
+```json
+{
+  "session": "vault-vs-vault-patched",
+  "algorithms": "Exact Symbol Name Match,Exact Function Bytes Match"
+}
+```
+
+The `session` field references the name returned by `vt_create_session`.
+`algorithms` is a comma-separated list; each corresponds to a VT correlator
+plugin (e.g. `Exact Symbol Name Match`, `Exact Function Bytes Match`,
+`Duplicate Function Match`, `Function Boundary Match`, etc.). If omitted, all
+available correlators are run.
+
+**`GET /vt_list_matches`**
+
+```
+?session=vault-vs-vault-patched&min_score=0.7&status=available
+```
+
+Returns a paginated list of matches with their confidence scores, status
+(`available`, `accepted`, `rejected`), and source/destination function info.
+
+**`POST /vt_accept_matches`**
+
+```json
+{
+  "session": "vault-vs-vault-patched",
+  "min_score": 0.7
+}
+```
+
+Accepts all matches above the score threshold.
+
+**`POST /vt_apply_markups`**
+
+```json
+{
+  "session": "vault-vs-vault-patched",
+  "types": "Function Name,Labels,Comments,Data Types"
+}
+```
+
+Applies the accepted match markups from source to dest. `types` is a
+comma-separated list of markup types to apply (`Function Name`, `Labels`,
+`Comments`, `Data Types`, `Plate Comments`, `Bookmarks`, etc.). If omitted,
+all registered markup types are applied.
+
+**Bridge wrappers:**
+
+```python
+vt_create_session(name, source_program, dest_program) -> dict
+vt_run_correlators(session, algorithms="") -> dict
+vt_list_matches(session, min_score=0.0, status="all", offset=0, limit=100) -> dict
+vt_accept_matches(session, min_score=0.0) -> dict
+vt_apply_markups(session, types="") -> dict
+vt_list_sessions() -> dict
+```
+
 ---
+
 
 ## Building
 
 ### Prerequisites
 
-- **Ghidra 12.1** install (any platform). The build uses eight JARs from a
+- **Ghidra 12.1.2** install (any platform). The build uses eight JARs from a
   real Ghidra install via Maven `system`-scoped dependencies.
 - **Java 21+** (match your Ghidra install's JVM version).
 - **Maven** ≥ 3.9.
@@ -349,13 +523,13 @@ also bump `extension.properties` `ghidraVersion=` and rebuild. Use
 From a machine on the same network as the host running Ghidra:
 
 ```sh
-nmap -Pn -sT -p 8090-8099 <ghidra-host>
+nmap -Pn -sT -p 8090-8129 <ghidra-host>
 ```
 
 Then probe each open port:
 
 ```sh
-for p in 8090 8091 8092 8093 8094 8095 8096 8097 8098 8099; do
+for p in $(seq 8090 8129); do
   curl -s --max-time 3 "http://<ghidra-host>:$p/info" && echo
 done
 ```
@@ -504,7 +678,7 @@ There are deliberately two version numbers:
   fixes, refactors). Lives in `pom.xml`, `extension.properties` `version=`,
   and `PLUGIN_VERSION` in the plugin source. Cycles with each release of the
   fork.
-- **Ghidra version** (currently `12.1`) — the Ghidra release this build is
+- **Ghidra version** (currently `12.1.2`) — the Ghidra release this build is
   *compatible* with. Lives in `extension.properties` `ghidraVersion=` and the
   eight dependency entries in `pom.xml`. Cycles only when Ghidra itself
   upgrades.
@@ -521,7 +695,7 @@ Ghidra version.
 
 ## Troubleshooting
 
-**No ports bind in 8090–8099.**
+**No ports bind in 8090–8129.**
 Almost always an `extension.properties` `ghidraVersion` mismatch. Check
 `Help → Show Log` in Ghidra for "extension not compatible". Rebuild `lib/`
 and bump versions to match.
