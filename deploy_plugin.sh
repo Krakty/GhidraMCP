@@ -140,7 +140,7 @@ if [[ -n "$RELEASE_TAG" ]]; then
 else
     if (( DO_BUILD )); then
         echo ">> mvn clean package"
-        JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/java-26-openjdk} mvn -q clean package
+        JAVA_HOME=${JAVA_HOME:-/path/to/your/jdk} mvn -q clean package
     fi
     # Find the built ZIP (filename includes plugin version, which we don't want
     # to hardcode here).

@@ -9,7 +9,7 @@ tool**, so multiple programs loaded simultaneously can be addressed in parallel
 without GUI program-switching.
 
 Fork of [LaurieWired/GhidraMCP](https://github.com/LaurieWired/GhidraMCP).
-Plugin version **0.2.1**, built against **Ghidra 12.1**.
+Plugin version **0.3.0**, built against **Ghidra 12.1**.
 
 ---
 
@@ -21,18 +21,19 @@ second program, you have to switch CodeBrowsers in the GUI, which is awkward
 when an LLM is driving the session.
 
 This fork makes the plugin **per-tool**: every CodeBrowser instance binds its
-own HTTP server on the first free port in `8090–8099`. Each port serves the
-same endpoint set as upstream, scoped to that tool's `getCurrentProgram()`. A
-discovery endpoint (`/info`) on each port lets clients map ports → loaded
-programs without any central coordinator.
+own HTTP server on the first free port in `8090–8129` (40 ports). Each port
+serves the same endpoint set as upstream, scoped to that tool's
+`getCurrentProgram()`. A discovery endpoint (`/info`) on each port lets clients
+map ports → loaded programs without any central coordinator.
 
 ```
                   ┌──────────────────────┐
                   │  Ghidra Project      │
                   │                      │
    CodeBrowser 1 ─┼─→ port 8090 ──┐      │
-   CodeBrowser 2 ─┼─→ port 8091 ──┼──→ MCP clients hit any port,
+   CodeBrowser 2 ─┼─→ port 8091 ──┼──→ MCP clients hit any open port,
    CodeBrowser 3 ─┼─→ port 8092 ──┘      use /info to discover
+   ...       up to port 8129             which program
                   └──────────────────────┘
 ```
 
@@ -49,7 +50,7 @@ tool to open.
 The plugin is loaded once per `PluginTool` (Ghidra default behavior). On
 startup, each instance:
 
-1. Walks `8090 → 8099` and binds the first free port.
+1. Walks `8090 → 8129` and binds the first free port.
 2. Fails silently and tries the next port on `BindException`.
 3. If the entire range is taken, logs an error and stays inactive.
 4. Otherwise registers the full endpoint set against `getCurrentProgram()` for
@@ -65,11 +66,11 @@ GET /info
 
 ```json
 {
-  "version":    "0.2.1",
+  "version":    "0.3.0",
   "port":       8090,
   "toolName":   "CodeBrowser",
-  "name":       "05-22-2026-LIVE-eqgame.exe",
-  "datePrefix": "05-22-2026"
+  "name":       "vulnerable-vault-app.exe",
+  "datePrefix": ""
 }
 ```
 
@@ -145,9 +146,16 @@ All endpoints are served on every bound port. They operate on
 | `/get_callgraph`                | GET    | BFS callgraph slice (callees/callers/both, depth-limited) |
 | `/list_scripts`                | GET    | Enumerate Ghidra scripts visible to run_script |
 | `/run_script`                  | POST   | Run a named or inline Python script; captures stdout/stderr/exit |
+| `/open_program`                | POST   | Open a project file in a new CodeBrowser tab |
 | `/dump/{uuid}`                 | GET    | Stream a spooled large response      |
 | `/dump/{uuid}`                 | DELETE | Explicit cleanup of a spooled file   |
 | `/dump`                        | GET    | List active spooled files            |
+| `/vt_list_sessions`            | GET    | List all Version Tracking sessions   |
+| `/vt_create_session`           | POST   | Create a new Version Tracking session |
+| `/vt_run_correlators`          | POST   | Run VT correlators on a session      |
+| `/vt_list_matches`             | GET    | List Version Tracking matches        |
+| `/vt_accept_matches`           | POST   | Accept VT matches                    |
+| `/vt_apply_markups`            | POST   | Apply markup from matched functions  |
 
 ### Large-response spool pattern (`to_file=true`)
 
@@ -204,7 +212,7 @@ hasn't classified yet.
 
 - **Ghidra 12.1** install (any platform). The build uses eight JARs from a
   real Ghidra install via Maven `system`-scoped dependencies.
-- **Java 26** (`/usr/lib/jvm/java-26-openjdk` on Arch).
+- **Java 21+** (match your Ghidra install's JVM version).
 - **Maven** ≥ 3.9.
 
 ### Refresh `lib/`
@@ -233,14 +241,14 @@ to deploy to.
 ### Build
 
 ```sh
-JAVA_HOME=/usr/lib/jvm/java-26-openjdk mvn clean package
+JAVA_HOME=/path/to/your/jdk mvn clean package
 ```
 
 Outputs in `target/`:
 
 - `GhidraMCPMultiProgram.jar` — runtime JAR.
 - `GhidraMCPMultiProgram-<pluginVersion>.zip` — Ghidra-installable extension
-  (e.g. `GhidraMCPMultiProgram-0.2.1.zip`).
+  (e.g. `GhidraMCPMultiProgram-0.3.0.zip`).
 
 ### Bumping versions for a new build
 
@@ -251,7 +259,7 @@ Outputs in `target/`:
 | `src/main/resources/extension.properties`       | `ghidraVersion` | **Ghidra** version, gates install       |
 | `GhidraMCPMultiProgramPlugin.java`              | `PLUGIN_VERSION`| Shown in `/info` and Ghidra console log |
 
-Plugin version (`0.2.1`, `0.2.2`, etc.) and Ghidra version (`12.1`, `12.2`) are
+Plugin version (`0.3.0`, `0.3.1`, etc.) and Ghidra version (`12.1`, `12.2`) are
 intentionally separate — they cycle on different cadences. Ghidra silently
 rejects any extension whose `ghidraVersion` doesn't match the running Ghidra;
 that's the most common cause of "plugin installed but no port binds".
@@ -298,15 +306,22 @@ dir over SSH. Use this so you don't have to bump `ghidraVersion=` in the repo
 for every Ghidra patch release.
 
 ```sh
-./deploy_plugin.sh [--host HOST] [--ghidra-install PATH] [--no-build] [--clean-stale]
+./deploy_plugin.sh [--host HOST | --local] [--ghidra-install PATH]
+                   [--no-build] [--clean-stale]
+                   [--release vX.Y.Z | --stable]
 ```
 
 - Default `--host` is `your-ghidra-host`; override for your setup.
+- `--local` deploys to the machine running the script (no SSH).
 - Default `--ghidra-install` is `/opt/ghidra`.
 - `--no-build` reuses the existing `target/*.zip`.
 - `--clean-stale` deletes any `GhidraMCPMultiProgram` dirs under
   `~/.config/ghidra/ghidra_*_DEV/Extensions/` whose version isn't the one
   you're deploying — keeps the host tidy after Ghidra patches.
+- `--release vX.Y.Z` downloads the ZIP from a **GitHub Release** instead of
+  building locally. Requires the `gh` CLI and network access.
+- `--stable` same as `--release` but fetches the latest published release
+  (the "panic button" for a known-good fallback).
 
 The script refuses to run if Ghidra is currently running on the target (the
 JVM holds the extension JAR open and installs would silently fail). Close
@@ -362,7 +377,7 @@ form `MM-DD-YYYY program.ext @ <port>`, and stamps it into every tool's
 description plus the MCP `serverInfo.name`. With one bridge per port, an LLM
 client running against six bridges sees six distinctly labeled tool catalogs
 instead of six indistinguishable `ghidra-*` blocks, so it can answer
-"decompile X in the 06-09 eqgame build" without manual port juggling.
+"decompile X in the 06-09 vault-app build" without manual port juggling.
 
 Also exposes a `program_info` MCP tool that returns the cached label + raw
 `/info` payload for mid-session self-discovery.
@@ -485,7 +500,7 @@ Then in Cline: **MCP Servers → Remote Servers → Add**
 
 There are deliberately two version numbers:
 
-- **Plugin version** (currently `0.2.1`) — tracks our own changes (features,
+- **Plugin version** (currently `0.3.0`) — tracks our own changes (features,
   fixes, refactors). Lives in `pom.xml`, `extension.properties` `version=`,
   and `PLUGIN_VERSION` in the plugin source. Cycles with each release of the
   fork.
@@ -548,7 +563,6 @@ upgrade.
 ├── deploy_bridge.sh                 # copy bridge to ~/.claude/mcp-servers/
 ├── deploy_plugin.sh                 # build + push Java JAR to remote Ghidra host
 ├── KRAKTY.md                        # fork architecture notes / decision log
-├── HANDOFF.md                       # historical: Ghidra 12.0.4 → 12.1 upgrade
 └── README.md                        # this file
 ```
 
