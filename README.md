@@ -293,6 +293,37 @@ list_scripts(offset: int = 0, limit: int = 500,
              language: str = None, to_file: bool = False) -> dict
 ```
 
+### Headless Ghidra (`analyzeHeadless`) vs this plugin
+
+Ghidra ships with a headless CLI (`analyzeHeadless`) that can open projects,
+import programs, run scripts, and save changes — all without a GUI. It is a
+powerful tool, but it operates as a **separate JVM process**, which has
+important implications compared to this plugin:
+
+| Aspect | `analyzeHeadless` CLI | This plugin (`/run_script`) |
+|---|---|---|
+| **Runtime** | Separate JVM, cold-start (10-30s) | Same JVM as the live Ghidra session |
+| **Project access** | Requires project lock — cannot run while GUI has the project open | Shares the GUI session's project — no lock contention |
+| **State visibility** | Reads only what is saved to the project DB | Sees in-flight changes from prior MCP calls (even uncommitted transactions) |
+| **Script context** | Full Ghidra API via `GhidraScript` | Same — scripts call `currentProgram`, `getFunctionAt`, flat API, etc. |
+| **Workflow fit** | Batch / CI pipelines, nightly re-analysis | Interactive RE sessions driven by agents |
+
+When to reach for each:
+
+- **Use headless** when you want to run a batch job (e.g., apply FLIRT
+  signatures to a fresh import, export all decompilations, run a FID scan)
+  without the GUI running at all. It is the right tool for offline / automated
+  pipelines.
+- **Use this plugin's `/run_script`** when the GUI session is already active
+  and you need to do something the existing endpoint set does not cover — a
+  five-line Python walk over the symbol table, a custom verification pass, or
+  calling an installed script like `ApplySig.py`. No cold-start, no project
+  lock conflict, and the script sees the same program state as the last MCP
+  call.
+
+The two are complementary. Headless is for CI; `/run_script` is for
+interactive agent-driven work.
+
 ### Version Tracker integration (`/vt_*`)
 
 Six endpoints wrap Ghidra's built-in Version Tracking, enabling automated
