@@ -325,6 +325,16 @@ class GhidraClient:
     def exports(self, offset: int = 0, limit: int = 100) -> dict:
         return self._get("exports", {"offset": offset, "limit": limit})
 
+    def rename(self, old_name: str | None = None, address: str | None = None,
+               new_name: str = "") -> dict:
+        if old_name:
+            return self._post("renameFunction",
+                              {"oldName": old_name, "newName": new_name})
+        if address:
+            return self._post("rename_function_by_address",
+                              {"function_address": address, "new_name": new_name})
+        return {"ok": False, "error": "rename requires old_name or address"}
+
 
 def _get_client(backend: Backend) -> GhidraClient:
     """Get or create a cached client for a backend."""
@@ -418,7 +428,7 @@ def ghidra_query(
     port: int | None = None,
     program: str | None = None,
     action: str | None = None,
-    args: str | None = None,
+    args: str | dict | None = None,
 ) -> dict:
     """
     Query any GhidraMCP backend through the multi-port bridge.
@@ -452,8 +462,14 @@ def ghidra_query(
                          Optional: ``{"offset":0, "limit":100}``.
         **exports**    — list exported symbols.
                          Optional: ``{"offset":0, "limit":100}``.
+        **rename**     — rename a function. Pass
+                         ``{"old_name":"FUN_...", "new_name":"MyFunc"}``
+                         (by old symbol name) **or**
+                         ``{"address":"0x140001000", "new_name":"MyFunc"}``
+                         (by address).
 
-    ``args`` is a JSON-encoded object with action-specific fields (see above).
+    ``args`` is a JSON-encoded string OR a pre-parsed dict with action-specific
+    fields (see above). Both forms are accepted transparently.
 
     Returns ``{"ok":true, "data":<response>, "port":N, "program":"..."}``
     on success, or ``{"ok":false, "error":"..."}`` on failure.
@@ -506,6 +522,11 @@ def ghidra_query(
             "exports": lambda: client.exports(
                 offset=parsed_args.get("offset", 0),
                 limit=parsed_args.get("limit", 100),
+            ),
+            "rename": lambda: client.rename(
+                old_name=parsed_args.get("old_name"),
+                address=parsed_args.get("address"),
+                new_name=parsed_args.get("new_name", ""),
             ),
         }
 
