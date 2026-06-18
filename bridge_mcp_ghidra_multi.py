@@ -38,11 +38,13 @@ import argparse
 import json
 import logging
 import re
+import socket
 import sys
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
 import requests
@@ -82,6 +84,8 @@ class PortScanner:
         self.allowed_date_prefix = allowed_date_prefix
         self._lock = threading.Lock()
         self._backends: dict[int, Backend] = {}
+        self._absent_ports: set[int] = set()
+        self._busy_ports: dict[int, float] = {}  # port -> last_busy_timestamp
 
     @property
     def backends(self) -> dict[int, Backend]:
@@ -93,15 +97,21 @@ class PortScanner:
         results: dict[int, Backend] = {}
         ports = range(self.port_start, self.port_end + 1)
 
+        def _tcp_open(host: str, port: int) -> bool:
+            """Check if TCP port is accepting connections."""
+            try:
+                sock = socket.create_connection((host, port), timeout=TCP_PROBE_TIMEOUT)
+                sock.close()
+                return True
+            except OSError:
+                return False
+
         def probe(port: int) -> Backend | None:
             url = f"http://{self.host}:{port}/"
             try:
-                resp = requests.get(urljoin(url, "info"), timeout=2)
+                resp = requests.get(urljoin(url, "info"), timeout=HTTP_PROBE_TIMEOUT)
                 if resp.ok:
                     info = resp.json()
-                    # Date-prefix firewall: if allowed_date_prefix is set,
-                    # only accept backends that match. This prevents the
-                    # cross-build contamination hazard (FP-SWARM-008/019/020).
                     if self.allowed_date_prefix:
                         dp = info.get("datePrefix", "")
                         if dp != self.allowed_date_prefix:
@@ -113,9 +123,27 @@ class PortScanner:
                         if date
                         else f"{name} @ {port}"
                     )
+                    # Clear any stale busy/absent state on successful probe
+                    with self._lock:
+                        self._absent_ports.discard(port)
+                        self._busy_ports.pop(port, None)
                     return Backend(port=port, base_url=url, info=info, label=label)
             except requests.RequestException:
                 pass
+
+            # HTTP probe failed — classify: busy vs absent (KRAKTY 20260618T214415)
+            tcp_reachable = _tcp_open(self.host, port)
+            if tcp_reachable:
+                # TCP open but HTTP failed → port is BUSY (not absent)
+                with self._lock:
+                    self._busy_ports[port] = time.time()
+                    self._absent_ports.discard(port)
+                logger.debug("Port %d: TCP open, HTTP failed — classified BUSY", port)
+            else:
+                with self._lock:
+                    self._absent_ports.add(port)
+                    self._busy_ports.pop(port, None)
+                logger.debug("Port %d: TCP closed — classified ABSENT", port)
             return None
 
         with ThreadPoolExecutor(max_workers=20) as pool:
@@ -233,6 +261,17 @@ mcp = FastMCP("ghidra-mcp-multi")
 # Global scanner + client cache — populated in main()
 _scanner: PortScanner | None = None
 _client_cache: dict[int, GhidraClient] = {}
+
+# Per-port serialization lock (KRAKTY 20260618T214415 — single-threaded per port)
+_port_locks: dict[int, threading.Lock] = {}
+_port_locks_lock = threading.Lock()
+
+# Busy-vs-absent detection (KRAKTY 20260618T214415)
+# Differentiate genuine backend absence (escalate) from temporary busy (back off)
+TCP_PROBE_TIMEOUT = 2.0       # seconds for TCP connect check
+HTTP_PROBE_TIMEOUT = 10.0      # seconds for /info HTTP check (was 2s)
+PORT_LOCK_TIMEOUT = 60.0       # max wait to acquire per-port lock
+PORT_BUSY_STATUS_TTL = 30.0    # how long "busy" status lasts before re-probe
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +447,7 @@ def ghidra_discover() -> dict:
     """
     assert _scanner is not None
     backends = _scanner.scan()
-    return {
+    result: dict = {
         "ok": True,
         "data": {
             str(p): {
@@ -421,6 +460,29 @@ def ghidra_discover() -> dict:
             for p, bk in sorted(backends.items())
         },
     }
+
+    # Report busy/absent ports for operational awareness (KRAKTY 20260618T214415)
+    now = time.time()
+    with _scanner._lock:
+        busy = {
+            str(p): {
+                "status": "busy",
+                "last_seen": ts,
+                "note": "TCP port is open but HTTP /info did not respond — "
+                        "backend may be processing a long request. Back off, "
+                        "do not escalate."
+            }
+            for p, ts in _scanner._busy_ports.items()
+            if now - ts < PORT_BUSY_STATUS_TTL
+        }
+        absent = sorted(str(p) for p in _scanner._absent_ports)
+
+    if busy:
+        result["busy_ports"] = busy
+    if absent:
+        result["absent_ports"] = absent
+
+    return result
 
 
 @mcp.tool()
@@ -484,18 +546,36 @@ def ghidra_query(
         return {"ok": False, "error": err}
     assert backend is not None
 
-    client = _get_client(backend)
+    # ── Per-port serialization (KRAKTY 20260618T214415) ──────────
+    # Acquire the lock for this specific port BEFORE making any HTTP call.
+    # Different ports are independent — no global lock.
+    p = backend.port
+    with _port_locks_lock:
+        if p not in _port_locks:
+            _port_locks[p] = threading.Lock()
+        port_lock = _port_locks[p]
 
-    parsed_args: dict = {}
-    if args:
-        try:
-            parsed_args = json.loads(args) if isinstance(args, str) else args
-        except (ValueError, json.JSONDecodeError) as e:
-            return {"ok": False, "error": f"args is not valid JSON: {e}"}
-    if not isinstance(parsed_args, dict):
-        return {"ok": False, "error": "args must be a JSON object (key-value pairs)"}
+    acquired = port_lock.acquire(timeout=PORT_LOCK_TIMEOUT)
+    if not acquired:
+        return {
+            "ok": False,
+            "error": f"Port {p} busy — could not acquire lock within {PORT_LOCK_TIMEOUT}s",
+            "port": p,
+            "status": "port_busy_timeout",
+        }
 
     try:
+        client = _get_client(backend)
+
+        parsed_args: dict = {}
+        if args:
+            try:
+                parsed_args = json.loads(args) if isinstance(args, str) else args
+            except (ValueError, json.JSONDecodeError) as e:
+                return {"ok": False, "error": f"args is not valid JSON: {e}"}
+        if not isinstance(parsed_args, dict):
+            return {"ok": False, "error": "args must be a JSON object (key-value pairs)"}
+
         action_map: dict[str, Callable[[], dict]] = {
             "info": lambda: client.info(),
             "decompile": lambda: client.decompile(
@@ -546,6 +626,8 @@ def ghidra_query(
     except Exception as e:
         logger.exception("ghidra_query failed")
         return {"ok": False, "error": str(e)}
+    finally:
+        port_lock.release()
 
 
 # ---------------------------------------------------------------------------
