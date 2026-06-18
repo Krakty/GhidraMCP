@@ -218,6 +218,23 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         return sb.toString();
     }
 
+    /** Minimal HTML escaper for the root status page. */
+    private static String escapeHtml(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '&':  sb.append("&amp;"); break;
+                case '<':  sb.append("&lt;");  break;
+                case '>':  sb.append("&gt;");  break;
+                case '"':  sb.append("&quot;"); break;
+                default:   sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
     // ----------------------------------------------------------------------------------
     // Per-tool HTTP server: bound in the constructor, registers every endpoint
     // against getCurrentProgram() so it's naturally scoped to this tool.
@@ -232,6 +249,48 @@ public class GhidraMCPMultiProgramPlugin extends Plugin {
         }
 
         server = HttpServer.create(new InetSocketAddress(port), 0);
+
+        // Root endpoint: self-identifying status page. When you curl a
+        // GhidraMCP port's root URL, you get back a clear description of
+        // what program this server is bound to — no more 404 mystery.
+        server.createContext("/", exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if (!path.equals("/")) {
+                // Let other contexts handle non-root paths
+                exchange.sendResponseHeaders(404, -1);
+                return;
+            }
+            Program p = getCurrentProgram();
+            String name = effectiveName(p);
+            String prefix = extractDatePrefix(name);
+            String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                + "<title>GhidraMCP &mdash; " + escapeHtml(name) + "</title>"
+                + "<style>body{font-family:sans-serif;margin:2em}"
+                + "h1{color:#333}pre{background:#f5f5f5;padding:1em;border-radius:4px}"
+                + "a{color:#06c}</style></head><body>"
+                + "<h1>GhidraMCP v" + PLUGIN_VERSION + "</h1>"
+                + "<p><strong>Program:</strong> " + escapeHtml(name) + "</p>"
+                + "<p><strong>Build:</strong> " + escapeHtml(prefix) + "</p>"
+                + "<p><strong>Port:</strong> " + boundPort + "</p>"
+                + "<p><strong>Tool:</strong> " + escapeHtml(tool.getName()) + "</p>"
+                + "<hr>"
+                + "<p>This is a GhidraMCP HTTP server. "
+                + "Query <a href='/info'><code>/info</code></a> for JSON metadata, "
+                + "or use any of the other REST endpoints "
+                + "(<code>/methods</code>, <code>/decompile</code>, "
+                + "<code>/segments</code>, <code>/exports</code>, etc.).</p>"
+                + "<p>Clients: use the MCP bridge "
+                + "(<code>bridge_mcp_ghidra_multi.py</code>) for auto-discovery.</p>"
+                + "<hr><small>GhidraMCP-MultiProgram v" + PLUGIN_VERSION
+                + " &mdash; Krakty fork of LaurieWired/GhidraMCP</small>"
+                + "</body></html>";
+            byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(bytes);
+            }
+        });
 
         // Discovery endpoint: returns metadata about what THIS port serves.
         // Claude (or any client) can scan PORT_RANGE_LOW..PORT_RANGE_HIGH and
