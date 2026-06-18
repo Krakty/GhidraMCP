@@ -74,10 +74,12 @@ class Backend:
 class PortScanner:
     """Scans a range of ports for GhidraMCP /info endpoints."""
 
-    def __init__(self, host: str, port_start: int = 8090, port_end: int = 8129):
+    def __init__(self, host: str, port_start: int = 8090, port_end: int = 8129,
+                 allowed_date_prefix: str | None = None):
         self.host = host
         self.port_start = port_start
         self.port_end = port_end
+        self.allowed_date_prefix = allowed_date_prefix
         self._lock = threading.Lock()
         self._backends: dict[int, Backend] = {}
 
@@ -97,6 +99,13 @@ class PortScanner:
                 resp = requests.get(urljoin(url, "info"), timeout=2)
                 if resp.ok:
                     info = resp.json()
+                    # Date-prefix firewall: if allowed_date_prefix is set,
+                    # only accept backends that match. This prevents the
+                    # cross-build contamination hazard (FP-SWARM-008/019/020).
+                    if self.allowed_date_prefix:
+                        dp = info.get("datePrefix", "")
+                        if dp != self.allowed_date_prefix:
+                            return None
                     name = info.get("name", "(no program)")
                     date = info.get("datePrefix", "")
                     label = (
@@ -377,11 +386,15 @@ def _require(d: dict, key: str, action: str) -> str:
 @mcp.tool()
 def ghidra_discover() -> dict:
     """
-    Re-scan the GhidraMCP port range (8090-8129) and report every live backend.
+    Re-scan the GhidraMCP port range and report every live backend.
 
     Call this after Ghidra is started/restarted or after CodeBrowser windows
     are opened/closed to refresh the port-to-program mapping.  Returns a dict
     keyed by port with program name, build date, and tool name.
+
+    Note: if the bridge was launched with ``--allow-date-prefix``, only
+    backends matching that build date are reported — all others are filtered
+    out to prevent cross-build contamination.
     """
     assert _scanner is not None
     backends = _scanner.scan()
@@ -533,6 +546,10 @@ def main() -> None:
                         help="Host where GhidraMCP backends run (default: 127.0.0.1)")
     parser.add_argument("--port-range", default="8090-8129",
                         help="Port range to probe, e.g. 8090-8129 (default)")
+    parser.add_argument("--allow-date-prefix", default=None,
+                        help="Only discover backends matching this build date "
+                             "(e.g. '03-16-2026'). Prevents cross-build "
+                             "contamination (FP-SWARM-008/019/020).")
     args = parser.parse_args()
 
     # Parse port range
@@ -549,6 +566,7 @@ def main() -> None:
         host=args.ghidra_host,
         port_start=port_start,
         port_end=port_end,
+        allowed_date_prefix=args.allow_date_prefix,
     )
 
     backends = _scanner.scan()
