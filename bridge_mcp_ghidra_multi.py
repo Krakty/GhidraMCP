@@ -44,7 +44,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from urllib.parse import urljoin
 
 import requests
@@ -270,8 +270,28 @@ _port_locks_lock = threading.Lock()
 # Differentiate genuine backend absence (escalate) from temporary busy (back off)
 TCP_PROBE_TIMEOUT = 2.0       # seconds for TCP connect check
 HTTP_PROBE_TIMEOUT = 10.0      # seconds for /info HTTP check (was 2s)
-PORT_LOCK_TIMEOUT = 60.0       # max wait to acquire per-port lock
+PORT_LOCK_TIMEOUT = 120.0      # max wait to acquire per-port lock
 PORT_BUSY_STATUS_TTL = 30.0    # how long "busy" status lasts before re-probe
+
+# Action-aware timeouts (KRAKTY 20260618T215154 — don't race the single thread)
+FAST_TIMEOUT   = 15.0   # info, search, segments, exports
+SLOW_TIMEOUT   = 120.0  # decompile, disasm, rename
+HEAVY_TIMEOUT  = 120.0  # run_script
+
+ACTION_TIMEOUTS: dict[str, float] = {
+    "info":       FAST_TIMEOUT,
+    "search":     FAST_TIMEOUT,
+    "segments":   FAST_TIMEOUT,
+    "exports":    FAST_TIMEOUT,
+    "decompile":  SLOW_TIMEOUT,
+    "disasm":     SLOW_TIMEOUT,
+    "run_script": HEAVY_TIMEOUT,
+    "rename":     SLOW_TIMEOUT,
+}
+
+# Transparent retry on connection failure (KRAKTY 20260618T215154)
+RETRY_BACKOFF = 2.0
+RETRY_MAX_ATTEMPTS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -280,46 +300,66 @@ PORT_BUSY_STATUS_TTL = 30.0    # how long "busy" status lasts before re-probe
 
 
 class GhidraClient:
-    """Thin HTTP wrapper around a single GhidraMCP backend."""
+    """Thin HTTP wrapper around a single GhidraMCP backend.
+
+    Supports action-aware timeouts (fast vs slow ops) and transparent
+    retry on connection failures.
+    """
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/") + "/"
 
-    def _get(self, endpoint: str, params: dict | None = None) -> dict:
-        url = urljoin(self.base_url, endpoint)
-        try:
-            resp = requests.get(url, params=params or {}, timeout=30)
-            resp.encoding = "utf-8"
-            if not resp.ok:
-                return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text.strip()}"}
-            text = resp.text.strip()
+    def _do_http(self, method: str, url: str,
+                  params: dict | None = None,
+                  data: dict | str | None = None,
+                  timeout: float = FAST_TIMEOUT) -> dict:
+        """Core HTTP call with retry. Idempotent for GET; for POST
+        we only retry on connection failure (not on HTTP error)."""
+        attempts = 0
+        last_err: Exception | None = None
+        while attempts < RETRY_MAX_ATTEMPTS:
+            attempts += 1
             try:
-                return {"ok": True, "data": resp.json()}
-            except (ValueError, json.JSONDecodeError):
-                return {"ok": True, "data": text.splitlines()}
-        except requests.RequestException as e:
-            return {"ok": False, "error": str(e)}
+                if method == "GET":
+                    resp = requests.get(url, params=params or {}, timeout=timeout)
+                else:
+                    if isinstance(data, dict):
+                        resp = requests.post(url, data=data, timeout=timeout)
+                    else:
+                        resp = requests.post(url, data=data.encode("utf-8")
+                                             if isinstance(data, str) else data,
+                                             timeout=timeout)
+                resp.encoding = "utf-8"
+                if not resp.ok:
+                    return {"ok": False,
+                            "error": f"HTTP {resp.status_code}: {resp.text.strip()}"}
+                text = resp.text.strip()
+                try:
+                    return {"ok": True, "data": resp.json()}
+                except (ValueError, json.JSONDecodeError):
+                    # Plain text response — return as lines for line-based endpoints
+                    return {"ok": True, "data": text.splitlines() if method == "GET" else text}
+            except requests.RequestException as e:
+                last_err = e
+                if attempts < RETRY_MAX_ATTEMPTS:
+                    logger.debug("Request failed (attempt %d/%d), backing off %.1fs: %s",
+                                 attempts, RETRY_MAX_ATTEMPTS, RETRY_BACKOFF, e)
+                    time.sleep(RETRY_BACKOFF)
+        return {"ok": False, "error": f"Request failed after {attempts} attempts: {last_err}"}
 
-    def _post(self, endpoint: str, data: dict | str) -> dict:
-        url = urljoin(self.base_url, endpoint)
-        try:
-            if isinstance(data, dict):
-                resp = requests.post(url, data=data, timeout=60)
-            else:
-                resp = requests.post(url, data=data.encode("utf-8"), timeout=60)
-            resp.encoding = "utf-8"
-            if not resp.ok:
-                return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text.strip()}"}
-            text = resp.text.strip()
-            try:
-                return {"ok": True, "data": resp.json()}
-            except (ValueError, json.JSONDecodeError):
-                return {"ok": True, "data": text}
-        except requests.RequestException as e:
-            return {"ok": False, "error": str(e)}
+    def _get(self, endpoint: str, params: dict | None = None,
+             timeout: float = FAST_TIMEOUT) -> dict:
+        return self._do_http("GET", urljoin(self.base_url, endpoint),
+                              params=params, timeout=timeout)
 
-    def _post_json(self, endpoint: str, data: dict | str) -> dict:
-        result = self._post(endpoint, data)
+    def _post(self, endpoint: str, data: dict | str,
+              timeout: float = SLOW_TIMEOUT) -> dict:
+        return self._do_http("POST", urljoin(self.base_url, endpoint),
+                              data=data, timeout=timeout)
+
+    def _post_json(self, endpoint: str, data: dict | str,
+                   timeout: float = SLOW_TIMEOUT) -> dict:
+        result = self._post(endpoint, data, timeout=timeout)
         if result.get("ok") and not isinstance(result["data"], dict):
             if isinstance(result["data"], str):
                 try:
@@ -329,21 +369,23 @@ class GhidraClient:
         return result
 
     def info(self) -> dict:
-        return self._get("info")
+        return self._get("info", timeout=FAST_TIMEOUT)
 
-    def decompile(self, name: str | None = None, address: str | None = None) -> dict:
+    def decompile(self, name: str | None = None, address: str | None = None,
+                  timeout: float = SLOW_TIMEOUT) -> dict:
         if name:
-            return self._post("decompile", name)
+            return self._post("decompile", name, timeout=timeout)
         if address:
-            return self._get("decompile_function", {"address": address})
+            return self._get("decompile_function", {"address": address}, timeout=timeout)
         return {"ok": False, "error": "decompile requires name or address"}
 
-    def disasm(self, address: str) -> dict:
-        return self._get("disassemble_function", {"address": address})
+    def disasm(self, address: str, timeout: float = SLOW_TIMEOUT) -> dict:
+        return self._get("disassemble_function", {"address": address}, timeout=timeout)
 
     def run_script(self, script_name: str | None = None,
                    script_body: str | None = None,
-                   args: list[str] | None = None) -> dict:
+                   args: list[str] | None = None,
+                   timeout: float = HEAVY_TIMEOUT) -> dict:
         payload: dict = {}
         if script_name is not None:
             payload["script_name"] = script_name
@@ -353,25 +395,33 @@ class GhidraClient:
             payload["args"] = "\n".join(args)
         if not script_name and not script_body:
             return {"ok": False, "error": "run_script requires script_name or script_body"}
-        return self._post_json("run_script", payload)
+        return self._post_json("run_script", payload, timeout=timeout)
 
-    def search(self, query: str, offset: int = 0, limit: int = 100) -> dict:
-        return self._get("searchFunctions", {"query": query, "offset": offset, "limit": limit})
+    def search(self, query: str, offset: int = 0, limit: int = 100,
+               timeout: float = FAST_TIMEOUT) -> dict:
+        return self._get("searchFunctions", {"query": query, "offset": offset, "limit": limit},
+                         timeout=timeout)
 
-    def segments(self, offset: int = 0, limit: int = 100) -> dict:
-        return self._get("segments", {"offset": offset, "limit": limit})
+    def segments(self, offset: int = 0, limit: int = 100,
+                 timeout: float = FAST_TIMEOUT) -> dict:
+        return self._get("segments", {"offset": offset, "limit": limit},
+                         timeout=timeout)
 
-    def exports(self, offset: int = 0, limit: int = 100) -> dict:
-        return self._get("exports", {"offset": offset, "limit": limit})
+    def exports(self, offset: int = 0, limit: int = 100,
+                timeout: float = FAST_TIMEOUT) -> dict:
+        return self._get("exports", {"offset": offset, "limit": limit},
+                         timeout=timeout)
 
     def rename(self, old_name: str | None = None, address: str | None = None,
-               new_name: str = "") -> dict:
+               new_name: str = "", timeout: float = SLOW_TIMEOUT) -> dict:
         if old_name:
             return self._post("renameFunction",
-                              {"oldName": old_name, "newName": new_name})
+                              {"oldName": old_name, "newName": new_name},
+                              timeout=timeout)
         if address:
             return self._post("rename_function_by_address",
-                              {"function_address": address, "new_name": new_name})
+                              {"function_address": address, "new_name": new_name},
+                              timeout=timeout)
         return {"ok": False, "error": "rename requires old_name or address"}
 
 
@@ -576,22 +626,27 @@ def ghidra_query(
         if not isinstance(parsed_args, dict):
             return {"ok": False, "error": "args must be a JSON object (key-value pairs)"}
 
+        act = action  # capture for closures
+        act_timeout = ACTION_TIMEOUTS.get(act, SLOW_TIMEOUT)
         action_map: dict[str, Callable[[], dict]] = {
             "info": lambda: client.info(),
-            "decompile": lambda: client.decompile(
+            "decompile": lambda t=act_timeout: client.decompile(
                 name=parsed_args.get("name"),
                 address=parsed_args.get("address"),
+                timeout=t,
             ),
-            "disasm": lambda: client.disasm(
-                address=_require(parsed_args, "address", action),
+            "disasm": lambda t=act_timeout: client.disasm(
+                address=_require(parsed_args, "address", act),
+                timeout=t,
             ),
-            "run_script": lambda: client.run_script(
+            "run_script": lambda t=act_timeout: client.run_script(
                 script_name=parsed_args.get("script_name"),
                 script_body=parsed_args.get("script_body"),
                 args=parsed_args.get("args"),
+                timeout=t,
             ),
             "search": lambda: client.search(
-                query=_require(parsed_args, "query", action),
+                query=_require(parsed_args, "query", act),
                 offset=parsed_args.get("offset", 0),
                 limit=parsed_args.get("limit", 100),
             ),
@@ -603,14 +658,15 @@ def ghidra_query(
                 offset=parsed_args.get("offset", 0),
                 limit=parsed_args.get("limit", 100),
             ),
-            "rename": lambda: client.rename(
+            "rename": lambda t=act_timeout: client.rename(
                 old_name=parsed_args.get("old_name"),
                 address=parsed_args.get("address"),
                 new_name=parsed_args.get("new_name", ""),
+                timeout=t,
             ),
         }
 
-        handler = action_map.get(action)
+        handler = action_map.get(act)
         if handler is None:
             valid = sorted(action_map)
             return {
